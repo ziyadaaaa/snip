@@ -1,128 +1,99 @@
-import OpenAI from "openai";
-
-const client = new OpenAI({
-  apiKey: process.env.OPENAI_API_KEY,
-});
-
 export default async function handler(req, res) {
-  // Allow the Chrome extension to call this API
+  // CORS
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type");
 
   if (req.method === "OPTIONS") {
-    return res.status(200).end();
+    return res.status(200).json({ ok: true });
   }
 
   if (req.method !== "POST") {
     return res.status(405).json({
-      error: "Method not allowed",
+      error: "Method not allowed"
     });
   }
 
   try {
-    const { question, blocks } = req.body || {};
-
-    if (!question || !Array.isArray(blocks) || blocks.length === 0) {
-      return res.status(400).json({
-        error: "question and blocks are required",
+    if (!process.env.OPENAI_API_KEY) {
+      return res.status(500).json({
+        error: "OPENAI_API_KEY is missing"
       });
     }
 
-    // Keep requests reasonably small
-    const limitedBlocks = blocks.slice(0, 150);
+    const { question, blocks } = req.body || {};
 
-    const response = await client.responses.create({
-      model: "gpt-5-mini",
-      store: false,
-      instructions: `
+    if (!question || !Array.isArray(blocks)) {
+      return res.status(400).json({
+        error: "question and blocks are required"
+      });
+    }
+
+    const prompt = `
 You are an evidence locator.
 
-The user asks a question about a webpage.
+The user asks:
 
-Your job is NOT to summarize or rewrite the webpage.
+${question}
 
-Find the smallest amount of source text that directly answers the question.
+Below are source blocks taken directly from the webpage.
 
-Return ONLY text copied exactly from the supplied webpage blocks.
+Find the smallest number of blocks containing the exact information needed to answer the user's question.
 
-Never invent words.
-Never paraphrase.
-Never combine words that do not appear together in a source block.
+IMPORTANT:
+- Do NOT paraphrase.
+- Do NOT invent text.
+- Return only text that appears exactly inside the supplied blocks.
+- Prefer the most directly relevant passage.
+- Return at most 3 pieces of evidence.
 
-If no block directly answers the question, return an empty evidence array.
+SOURCE BLOCKS:
 
-Return JSON with:
-{
-  "evidence": [
-    {
-      "block_id": "the source block id",
-      "text": "exact copied text",
-      "confidence": 0.0
-    }
-  ]
-}
+${blocks.map(b => `[${b.id}]\n${b.text}`).join("\n\n")}
+`;
 
-Prefer one strong passage over several weak passages.
-      `,
-      input: JSON.stringify({
-        question,
-        blocks: limitedBlocks,
-      }),
-      text: {
-        format: {
-          type: "json_schema",
-          name: "evidence_result",
-          strict: true,
-          schema: {
-            type: "object",
-            properties: {
-              evidence: {
-                type: "array",
-                maxItems: 3,
-                items: {
-                  type: "object",
-                  properties: {
-                    block_id: { type: "string" },
-                    text: { type: "string" },
-                    confidence: {
-                      type: "number",
-                      minimum: 0,
-                      maximum: 1,
-                    },
-                  },
-                  required: ["block_id", "text", "confidence"],
-                  additionalProperties: false,
-                },
-              },
-            },
-            required: ["evidence"],
-            additionalProperties: false,
-          },
+    const openaiResponse = await fetch(
+      "https://api.openai.com/v1/responses",
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization": `Bearer ${process.env.OPENAI_API_KEY}`
         },
-      },
-    });
+        body: JSON.stringify({
+          model: "gpt-5-mini",
+          input: prompt,
+          store: false
+        })
+      }
+    );
 
-    const result = JSON.parse(response.output_text || '{"evidence":[]}');
+    const raw = await openaiResponse.text();
 
-    // Safety check: make absolutely sure the AI returned
-    // text that actually exists in the supplied source.
-    const safeEvidence = result.evidence.filter((item) => {
-      const block = limitedBlocks.find(
-        (b) => String(b.id) === String(item.block_id)
-      );
+    if (!openaiResponse.ok) {
+      console.error("OpenAI error:", raw);
 
-      return block && block.text.includes(item.text);
-    });
+      return res.status(502).json({
+        error: "OpenAI request failed",
+        details: raw
+      });
+    }
+
+    const data = JSON.parse(raw);
+
+    const outputText = data.output_text || "";
 
     return res.status(200).json({
-      evidence: safeEvidence,
+      evidence: [],
+      raw: outputText
     });
+
   } catch (error) {
-    console.error(error);
+    console.error("FUNCTION ERROR:", error);
 
     return res.status(500).json({
-      error: "AI request failed",
+      error: "Function failed",
+      details: error.message
     });
   }
 }
