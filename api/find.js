@@ -64,7 +64,7 @@ ${question.trim()}
 
 Find the smallest passage or passages in the supplied webpage blocks that directly contain the information needed to answer the question.
 
-IMPORTANT:
+Rules:
 - Do NOT answer the question.
 - Do NOT summarize.
 - Do NOT paraphrase.
@@ -74,9 +74,7 @@ IMPORTANT:
 
 SOURCE BLOCKS:
 
-${safeBlocks
-  .map(b => `[${b.id}]\n${b.text}`)
-  .join("\n\n")}
+${safeBlocks.map(b => `[${b.id}]\n${b.text}`).join("\n\n")}
 `;
 
     const openaiResponse = await fetch(
@@ -85,7 +83,7 @@ ${safeBlocks
         method: "POST",
         headers: {
           "Content-Type": "application/json",
-          Authorization: `Bearer ${apiKey}`
+          "Authorization": `Bearer ${apiKey}`
         },
         body: JSON.stringify({
           model: "gpt-5-mini",
@@ -130,13 +128,11 @@ ${safeBlocks
     const raw = await openaiResponse.text();
 
     if (!openaiResponse.ok) {
-      let details;
+      let details = {};
 
       try {
         details = JSON.parse(raw);
-      } catch {
-        details = {};
-      }
+      } catch {}
 
       console.error("OPENAI ERROR:", details);
 
@@ -158,13 +154,45 @@ ${safeBlocks
       });
     }
 
-    const outputText = data.output_text || "";
+    // Extract text from the Responses API output items.
+    let outputText = "";
+
+    if (Array.isArray(data.output)) {
+      for (const item of data.output) {
+        if (!Array.isArray(item.content)) continue;
+
+        for (const content of item.content) {
+          if (
+            content &&
+            content.type === "output_text" &&
+            typeof content.text === "string"
+          ) {
+            outputText += content.text;
+          }
+        }
+      }
+    }
+
+    // Fallback for clients/API versions that expose output_text directly.
+    if (!outputText && typeof data.output_text === "string") {
+      outputText = data.output_text;
+    }
+
+    if (!outputText.trim()) {
+      console.error("EMPTY AI OUTPUT:", raw.slice(0, 3000));
+
+      return res.status(502).json({
+        error: "AI returned no usable output"
+      });
+    }
 
     let result;
 
     try {
       result = JSON.parse(outputText);
     } catch {
+      console.error("AI OUTPUT WAS NOT JSON:", outputText);
+
       return res.status(502).json({
         error: "Invalid AI JSON response"
       });
@@ -174,7 +202,7 @@ ${safeBlocks
       ? result.evidence
       : [];
 
-    // Verify every selected passage against the actual source.
+    // Verify the AI-selected text against the actual webpage content.
     const verified = evidence
       .filter(
         item =>
@@ -202,11 +230,13 @@ ${safeBlocks
     return res.status(200).json({
       evidence: verified
     });
+
   } catch (error) {
     console.error("FUNCTION ERROR:", error);
 
     return res.status(500).json({
-      error: "Function failed"
+      error: "Function failed",
+      message: error.message
     });
   }
 }
