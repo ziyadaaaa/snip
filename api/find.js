@@ -203,29 +203,27 @@ export default async function handler(req, res) {
 
     /*
      * ---------------------------------------------------------
-     * SPLIT PAGE INTO CHUNKS
+     * SPLIT PAGE INTO CHUNKS (WITH OVERLAP FOR CONTEXT)
      * ---------------------------------------------------------
-     *
-     * We search each chunk independently so large webpages
-     * don't overwhelm a single model call.
      */
 
-    const CHUNK_SIZE = 30000;
-
+    const CHUNK_SIZE = 50000;
     const chunks = [];
 
     let currentChunk = [];
     let currentLength = 0;
 
-    for (const block of safeBlocks) {
+    for (let i = 0; i < safeBlocks.length; i++) {
+      const block = safeBlocks[i];
       if (
         currentChunk.length &&
         currentLength + block.text.length > CHUNK_SIZE
       ) {
         chunks.push(currentChunk);
-
-        currentChunk = [];
-        currentLength = 0;
+        // Keep the last 2 blocks as an overlap so context isn't severed at boundaries
+        const overlap = currentChunk.slice(-2);
+        currentChunk = [...overlap];
+        currentLength = overlap.reduce((sum, b) => sum + b.text.length, 0);
       }
 
       currentChunk.push(block);
@@ -248,7 +246,7 @@ export default async function handler(req, res) {
       properties: {
         candidates: {
           type: "array",
-          maxItems: 8,
+          maxItems: 12,
           items: {
             type: "object",
             additionalProperties: false,
@@ -302,35 +300,11 @@ TASK:
 
 Find the blocks most likely to contain the information needed to answer the user's question.
 
+Pay special attention to broader questions requiring sequences of events, multi-step procedures, timelines, safety protocols, or distributed facts (e.g., quarantine steps, sequences after landing).
+
 Think about MEANING, CONTEXT, EVENTS, PEOPLE, ACTIONS, DATES, LOCATIONS, CAUSES, RESULTS, and SEQUENCES.
 
 The user's wording may be completely different from the wording on the page.
-
-Example:
-
-Question:
-"How did Apollo 11 return to Earth?"
-
-Page:
-"The crew returned safely to Earth on July 24, splashing down in the Pacific Ocean."
-
-This is a strong match even though the page does not literally contain the phrase:
-"How did Apollo 11 return to Earth?"
-
-Another example:
-
-Question:
-"What was the quarantine procedure after the astronauts returned?"
-
-Relevant page text might discuss:
-- biological isolation garments
-- the life raft
-- decontamination
-- the recovery helicopter
-- the mobile quarantine facility
-- 21 days of quarantine
-
-These concepts are related even if the word "procedure" is not present.
 
 IMPORTANT:
 
@@ -347,7 +321,7 @@ IMPORTANT:
 - Do not quote page text.
 - If nothing in this chunk is useful, return an empty candidates array.
 
-Return up to 8 strong candidates.
+Return up to 12 strong candidates.
 
 Give each candidate a relevance score from 0 to 100.
 `;
@@ -357,7 +331,7 @@ Give each candidate a relevance score from 0 to 100.
           prompt,
           schema: candidateSchema,
           name: "snip_semantic_candidates",
-          maxOutputTokens: 1000
+          maxOutputTokens: 1200
         });
 
         if (
@@ -457,16 +431,8 @@ Give each candidate a relevance score from 0 to 100.
 
     /*
      * ---------------------------------------------------------
-     * EXPAND CANDIDATES WITH NEIGHBORING BLOCKS
+     * EXPAND CANDIDATES WITH WIDER NEIGHBORING BLOCKS
      * ---------------------------------------------------------
-     *
-     * This is extremely important.
-     *
-     * Webpages often split one logical paragraph or event
-     * across several DOM blocks.
-     *
-     * If block 50 is relevant, blocks 49 and 51 may contain
-     * the context needed to understand it.
      */
 
     const expandedIdSet = new Set();
@@ -485,19 +451,18 @@ Give each candidate a relevance score from 0 to 100.
       }
 
       /*
-       * Include one block before and two blocks after.
-       *
-       * This gives the final model enough local context
-       * without dumping the entire page back into the prompt.
+       * Expanded safety window: 2 blocks before and 4 blocks after.
+       * This ensures sequential list items, bullet points, and procedure 
+       * steps separated by spacing are never cut off.
        */
 
       for (
         let i =
-          Math.max(0, index - 1);
+          Math.max(0, index - 2);
         i <=
           Math.min(
             safeBlocks.length - 1,
-            index + 2
+            index + 4
           );
         i++
       ) {
@@ -512,12 +477,6 @@ Give each candidate a relevance score from 0 to 100.
         expandedIdSet.has(block.id)
     );
 
-    /*
-     * If semantic retrieval somehow returned nothing,
-     * don't immediately fail. Try a broader fallback search
-     * using the first portion of the page.
-     */
-
     if (!candidateBlocks.length) {
       const fallbackBlocks =
         safeBlocks.slice(0, 40);
@@ -530,7 +489,7 @@ Give each candidate a relevance score from 0 to 100.
      */
 
     candidateBlocks =
-      candidateBlocks.slice(0, 40);
+      candidateBlocks.slice(0, 50);
 
     /*
      * ---------------------------------------------------------
@@ -544,7 +503,7 @@ Give each candidate a relevance score from 0 to 100.
       properties: {
         evidence: {
           type: "array",
-          maxItems: 3,
+          maxItems: 4,
           items: {
             type: "object",
             additionalProperties: false,
@@ -602,22 +561,11 @@ ${finalSource}
 
 TASK:
 
-Identify the smallest original passage or passages that contain the information needed to answer the user's question.
+Identify the precise passage or passages that contain the information needed to answer the user's question. 
+
+For procedural, sequential, or multi-part questions (e.g., quarantine steps, timelines, sequences of events), select the necessary contiguous block or sentences that fully map out the procedure or sequence.
 
 Think semantically.
-
-The wording of the question may be completely different from the wording of the webpage.
-
-Example:
-
-Question:
-"How did Apollo 11 return to Earth?"
-
-Possible relevant webpage text:
-
-"They rejoined Collins in lunar orbit, and the crew returned safely to Earth on July 24, splashing down in the Pacific Ocean."
-
-This is relevant because it describes the actual return.
 
 IMPORTANT RULES:
 
@@ -635,27 +583,21 @@ IMPORTANT RULES:
 
 7. Never combine unrelated blocks.
 
-8. Prefer the smallest useful passage.
+8. Prefer the smallest useful passage, but ensure multi-part procedures include their necessary context.
 
-9. Normally select 1-3 sentences.
+9. Normally select 1-4 sentences or paragraphs.
 
-10. If one sentence is enough, select one sentence.
+10. A passage does NOT need to contain the exact words from the question.
 
-11. If understanding the answer requires adjacent context, select the smallest contiguous passage necessary.
+11. Prefer evidence that directly explains the requested event, action, cause, result, procedure, person, date, or outcome.
 
-12. A passage does NOT need to contain the exact words from the question.
+12. If none of the supplied blocks actually contain useful evidence, return an empty evidence array.
 
-13. Do not select text merely because it shares keywords.
-
-14. Prefer evidence that directly explains the requested event, action, cause, result, procedure, person, date, or outcome.
-
-15. If none of the supplied blocks actually contain useful evidence, return an empty evidence array.
-
-16. Never fabricate evidence.
+13. Never fabricate evidence.
 
 The final text will be highlighted directly on the original webpage, so accuracy is extremely important.
 
-Return up to 3 evidence passages.
+Return up to 4 evidence passages.
 `;
 
     let finalResult;
@@ -665,7 +607,7 @@ Return up to 3 evidence passages.
         prompt: finalPrompt,
         schema: finalSchema,
         name: "snip_exact_evidence",
-        maxOutputTokens: 1200
+        maxOutputTokens: 1500
       });
     } catch (error) {
       console.error(
@@ -697,11 +639,6 @@ Return up to 3 evidence passages.
         .trim()
         .toLowerCase();
     }
-
-    /*
-     * Remove punctuation that commonly differs between
-     * webpage extraction and model output.
-     */
 
     function normalizeLoose(value) {
       return normalizeForMatch(value)
@@ -752,11 +689,6 @@ Return up to 3 evidence passages.
         continue;
       }
 
-      /*
-       * Best case:
-       * exact normalized containment.
-       */
-
       if (actual.includes(wanted)) {
         evidence.push({
           block_id: block.id,
@@ -769,11 +701,6 @@ Return up to 3 evidence passages.
 
         continue;
       }
-
-      /*
-       * Second case:
-       * punctuation / quote / dash differences.
-       */
 
       const wantedLoose =
         normalizeLoose(
@@ -791,16 +718,6 @@ Return up to 3 evidence passages.
           wantedLoose
         )
       ) {
-        /*
-         * The model's text is semantically and
-         * textually identical after normalization.
-         *
-         * Return the original block text only when
-         * the selected text is effectively the whole
-         * block. Otherwise reject it rather than
-         * highlighting inaccurate text.
-         */
-
         const originalLength =
           normalizeLoose(
             block.text
@@ -825,12 +742,6 @@ Return up to 3 evidence passages.
 
         continue;
       }
-
-      /*
-       * Do NOT blindly accept fuzzy word matching.
-       *
-       * Snip must highlight real webpage text.
-       */
     }
 
     /*
@@ -883,7 +794,7 @@ Return up to 3 evidence passages.
     return res.status(200).json({
       evidence:
         uniqueEvidence
-          .slice(0, 3)
+          .slice(0, 4)
           .map(item => ({
             block_id:
               item.block_id,
