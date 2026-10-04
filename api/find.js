@@ -4,42 +4,32 @@ export default async function handler(req, res) {
   res.setHeader("Access-Control-Allow-Headers", "Content-Type");
   res.setHeader("Cache-Control", "no-store");
 
-  if (req.method === "OPTIONS") return res.status(204).end();
+  if (req.method === "OPTIONS") {
+    return res.status(204).end();
+  }
+
   if (req.method !== "POST") {
-    return res.status(405).json({ error: "Method not allowed" });
+    return res.status(405).json({
+      error: "Method not allowed"
+    });
   }
 
   try {
     if (!process.env.OPENAI_API_KEY) {
-      return res.status(500).json({ error: "OPENAI_API_KEY is missing" });
+      return res.status(500).json({
+        error: "OPENAI_API_KEY is missing"
+      });
     }
 
-    const body = req.body || {};
-    const question =
-      typeof body.question === "string" ? body.question.trim() : "";
-    const blocks = Array.isArray(body.blocks) ? body.blocks : null;
+    const { question, blocks } = req.body || {};
 
-    if (!question || !blocks) {
+    if (
+      typeof question !== "string" ||
+      !question.trim() ||
+      !Array.isArray(blocks)
+    ) {
       return res.status(400).json({
         error: "question and blocks are required"
-      });
-    }
-
-    if (question.length > 1000) {
-      return res.status(400).json({
-        error: "Question is too long"
-      });
-    }
-
-    if (blocks.length === 0) {
-      return res.status(400).json({
-        error: "No readable page content was found"
-      });
-    }
-
-    if (blocks.length > 350) {
-      return res.status(400).json({
-        error: "Page contains too much content for one search"
       });
     }
 
@@ -50,11 +40,11 @@ export default async function handler(req, res) {
           typeof b.id === "string" &&
           typeof b.text === "string"
       )
+      .slice(0, 200)
       .map(b => ({
-        id: b.id.slice(0, 80),
-        text: b.text.trim().slice(0, 2500)
-      }))
-      .filter(b => b.id && b.text.length >= 10);
+        id: b.id,
+        text: b.text.slice(0, 2000)
+      }));
 
     if (!safeBlocks.length) {
       return res.status(400).json({
@@ -62,33 +52,40 @@ export default async function handler(req, res) {
       });
     }
 
-    const source = safeBlocks
-      .map(b => `[${b.id}]\n${b.text}`)
-      .join("\n\n");
+    const prompt = `
+You are an exact webpage evidence locator.
 
-    const prompt = `You are Snip, an exact source locator.
+The user asks:
 
-User question:
-${question}
+${question.trim()}
 
-Your job is NOT to answer the question. Your job is to identify the smallest passage(s) on this webpage that contain the information needed to answer it.
+Find the smallest passage from the supplied webpage blocks that directly answers the question.
 
-Return ONLY JSON in this exact shape:
-{"evidence":[{"block_id":"...","text":"..."}]}
+Return ONLY valid JSON:
+
+{
+  "evidence": [
+    {
+      "block_id": "exact block id",
+      "text": "exact text copied from the block"
+    }
+  ]
+}
 
 Rules:
-- Return at most 3 evidence items.
-- block_id must exactly match a supplied block ID.
-- text must be copied verbatim from that block, including punctuation.
-- Keep each text selection as short as possible while preserving the useful information.
-- Never paraphrase, rewrite, combine, or invent text.
-- If the page does not contain the requested information, return {"evidence":[]}.
-- Do not include markdown or commentary.
+- Return at most 3 items.
+- Never paraphrase.
+- Never invent text.
+- The text must appear exactly inside the supplied block.
+- If the answer cannot be found, return:
+{"evidence":[]}
 
 SOURCE BLOCKS:
-${source}`;
 
-    const openaiResponse = await fetch(
+${safeBlocks.map(b => `[${b.id}]\n${b.text}`).join("\n\n")}
+`;
+
+    const response = await fetch(
       "https://api.openai.com/v1/responses",
       {
         method: "POST",
@@ -105,48 +102,50 @@ ${source}`;
       }
     );
 
-    const raw = await openaiResponse.text();
+    const raw = await response.text();
 
-if (!openaiResponse.ok) {
-  let details = {};
+    if (!response.ok) {
+      let details;
 
-  try {
-    details = JSON.parse(raw);
-  } catch {
-    details = { raw: raw.slice(0, 500) };
-  }
+      try {
+        details = JSON.parse(raw);
+      } catch {
+        details = {
+          raw: raw.slice(0, 1000)
+        };
+      }
 
-  console.error("OpenAI request failed:", details);
+      console.error("OPENAI ERROR:", details);
 
-  return res.status(502).json({
-    error: "OpenAI request failed",
-    code: details?.error?.code || null,
-    type: details?.error?.type || null,
-    message: details?.error?.message || null
-  });
-}
+      return res.status(502).json({
+        error: "OpenAI request failed",
+        status: response.status,
+        code: details?.error?.code || null,
+        type: details?.error?.type || null,
+        message: details?.error?.message || details?.raw || null
+      });
+    }
+
     let data;
 
     try {
       data = JSON.parse(raw);
     } catch {
       return res.status(502).json({
-        error: "Invalid response from AI service"
+        error: "Invalid OpenAI response"
       });
     }
+
+    const outputText = data.output_text || "";
 
     let parsed;
 
     try {
-      parsed = JSON.parse(data.output_text || "");
+      parsed = JSON.parse(outputText);
     } catch {
-      console.error(
-        "Invalid model JSON:",
-        String(data.output_text || "").slice(0, 1000)
-      );
-
       return res.status(502).json({
-        error: "Snip received an invalid AI response"
+        error: "Invalid AI JSON response",
+        raw: outputText.slice(0, 1000)
       });
     }
 
@@ -154,7 +153,7 @@ if (!openaiResponse.ok) {
       ? parsed.evidence
       : [];
 
-    const valid = evidence
+    const verified = evidence
       .filter(
         item =>
           item &&
@@ -179,13 +178,14 @@ if (!openaiResponse.ok) {
       .slice(0, 3);
 
     return res.status(200).json({
-      evidence: valid
+      evidence: verified
     });
   } catch (error) {
     console.error("FUNCTION ERROR:", error);
 
     return res.status(500).json({
-      error: "Function failed"
+      error: "Function failed",
+      message: error.message
     });
   }
 }
