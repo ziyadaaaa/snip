@@ -107,17 +107,24 @@ ${source}`;
 
     const raw = await openaiResponse.text();
 
-    if (!openaiResponse.ok) {
-      console.error(
-        "OpenAI request failed:",
-        raw.slice(0, 2000)
-      );
+if (!openaiResponse.ok) {
+  let details = {};
 
-      return res.status(502).json({
-        error: "OpenAI request failed"
-      });
-    }
+  try {
+    details = JSON.parse(raw);
+  } catch {
+    details = { raw: raw.slice(0, 500) };
+  }
 
+  console.error("OpenAI request failed:", details);
+
+  return res.status(502).json({
+    error: "OpenAI request failed",
+    code: details?.error?.code || null,
+    type: details?.error?.type || null,
+    message: details?.error?.message || null
+  });
+}
     let data;
 
     try {
