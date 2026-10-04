@@ -15,7 +15,9 @@ export default async function handler(req, res) {
   }
 
   try {
-    if (!process.env.OPENAI_API_KEY) {
+    const apiKey = process.env.OPENAI_API_KEY;
+
+    if (!apiKey) {
       return res.status(500).json({
         error: "OPENAI_API_KEY is missing"
       });
@@ -40,11 +42,12 @@ export default async function handler(req, res) {
           typeof b.id === "string" &&
           typeof b.text === "string"
       )
-      .slice(0, 200)
+      .slice(0, 250)
       .map(b => ({
-        id: b.id,
-        text: b.text.slice(0, 2000)
-      }));
+        id: b.id.slice(0, 100),
+        text: b.text.trim().slice(0, 2500)
+      }))
+      .filter(b => b.text.length > 0);
 
     if (!safeBlocks.length) {
       return res.status(400).json({
@@ -53,76 +56,95 @@ export default async function handler(req, res) {
     }
 
     const prompt = `
-You are an exact webpage evidence locator.
+You are Snip, an exact webpage-location finder.
 
 The user asks:
 
 ${question.trim()}
 
-Find the smallest passage from the supplied webpage blocks that directly answers the question.
+Find the smallest passage or passages in the supplied webpage blocks that directly contain the information needed to answer the question.
 
-Return ONLY valid JSON:
-
-{
-  "evidence": [
-    {
-      "block_id": "exact block id",
-      "text": "exact text copied from the block"
-    }
-  ]
-}
-
-Rules:
-- Return at most 3 items.
-- Never paraphrase.
-- Never invent text.
-- The text must appear exactly inside the supplied block.
-- If the answer cannot be found, return:
-{"evidence":[]}
+IMPORTANT:
+- Do NOT answer the question.
+- Do NOT summarize.
+- Do NOT paraphrase.
+- Only select text that appears exactly in the supplied blocks.
+- Return at most 3 passages.
+- If the information is not present, return no evidence.
 
 SOURCE BLOCKS:
 
-${safeBlocks.map(b => `[${b.id}]\n${b.text}`).join("\n\n")}
+${safeBlocks
+  .map(b => `[${b.id}]\n${b.text}`)
+  .join("\n\n")}
 `;
 
-    const response = await fetch(
+    const openaiResponse = await fetch(
       "https://api.openai.com/v1/responses",
       {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
-          "Authorization": `Bearer ${process.env.OPENAI_API_KEY}`
+          Authorization: `Bearer ${apiKey}`
         },
         body: JSON.stringify({
           model: "gpt-5-mini",
           input: prompt,
           store: false,
-          max_output_tokens: 500
+          max_output_tokens: 600,
+          text: {
+            format: {
+              type: "json_schema",
+              name: "snip_evidence",
+              strict: true,
+              schema: {
+                type: "object",
+                additionalProperties: false,
+                properties: {
+                  evidence: {
+                    type: "array",
+                    maxItems: 3,
+                    items: {
+                      type: "object",
+                      additionalProperties: false,
+                      properties: {
+                        block_id: {
+                          type: "string"
+                        },
+                        text: {
+                          type: "string"
+                        }
+                      },
+                      required: ["block_id", "text"]
+                    }
+                  }
+                },
+                required: ["evidence"]
+              }
+            }
+          }
         })
       }
     );
 
-    const raw = await response.text();
+    const raw = await openaiResponse.text();
 
-    if (!response.ok) {
+    if (!openaiResponse.ok) {
       let details;
 
       try {
         details = JSON.parse(raw);
       } catch {
-        details = {
-          raw: raw.slice(0, 1000)
-        };
+        details = {};
       }
 
       console.error("OPENAI ERROR:", details);
 
       return res.status(502).json({
         error: "OpenAI request failed",
-        status: response.status,
+        status: openaiResponse.status,
         code: details?.error?.code || null,
-        type: details?.error?.type || null,
-        message: details?.error?.message || details?.raw || null
+        message: details?.error?.message || null
       });
     }
 
@@ -138,21 +160,21 @@ ${safeBlocks.map(b => `[${b.id}]\n${b.text}`).join("\n\n")}
 
     const outputText = data.output_text || "";
 
-    let parsed;
+    let result;
 
     try {
-      parsed = JSON.parse(outputText);
+      result = JSON.parse(outputText);
     } catch {
       return res.status(502).json({
-        error: "Invalid AI JSON response",
-        raw: outputText.slice(0, 1000)
+        error: "Invalid AI JSON response"
       });
     }
 
-    const evidence = Array.isArray(parsed.evidence)
-      ? parsed.evidence
+    const evidence = Array.isArray(result.evidence)
+      ? result.evidence
       : [];
 
+    // Verify every selected passage against the actual source.
     const verified = evidence
       .filter(
         item =>
@@ -171,7 +193,7 @@ ${safeBlocks.map(b => `[${b.id}]\n${b.text}`).join("\n\n")}
 
         return (
           block &&
-          item.text &&
+          item.text.length > 0 &&
           block.text.includes(item.text)
         );
       })
@@ -184,8 +206,7 @@ ${safeBlocks.map(b => `[${b.id}]\n${b.text}`).join("\n\n")}
     console.error("FUNCTION ERROR:", error);
 
     return res.status(500).json({
-      error: "Function failed",
-      message: error.message
+      error: "Function failed"
     });
   }
 }
