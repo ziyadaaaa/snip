@@ -4,13 +4,20 @@ export default async function handler(req, res) {
   res.setHeader("Access-Control-Allow-Headers", "Content-Type");
   res.setHeader("Cache-Control", "no-store");
 
-  if (req.method === "OPTIONS") return res.status(204).end();
+  if (req.method === "OPTIONS") {
+    return res.status(204).end();
+  }
+
   if (req.method !== "POST") {
-    return res.status(405).json({ error: "Method not allowed" });
+    return res.status(405).json({
+      error: "Method not allowed"
+    });
   }
 
   try {
-    if (!process.env.OPENAI_API_KEY) {
+    const apiKey = process.env.OPENAI_API_KEY;
+
+    if (!apiKey) {
       return res.status(500).json({
         error: "OPENAI_API_KEY is missing"
       });
@@ -26,17 +33,11 @@ export default async function handler(req, res) {
     const blocks =
       Array.isArray(body.blocks)
         ? body.blocks
-        : null;
+        : [];
 
-    if (!question || !blocks) {
+    if (!question) {
       return res.status(400).json({
-        error: "question and blocks are required"
-      });
-    }
-
-    if (question.length > 1000) {
-      return res.status(400).json({
-        error: "Question is too long"
+        error: "Question is required"
       });
     }
 
@@ -47,38 +48,31 @@ export default async function handler(req, res) {
     }
 
     /*
-     * Large-page support.
-     *
-     * The old version effectively depended on one giant AI request.
-     * This version accepts much larger pages and divides them into
-     * independent search chunks.
+     * Clean and normalize the blocks coming from the extension.
      */
-    if (blocks.length > 3000) {
-      return res.status(400).json({
-        error: "Page contains too much unreadable/duplicate content"
-      });
-    }
-
     const safeBlocks = [];
     let totalChars = 0;
 
-    for (const b of blocks) {
+    for (const block of blocks) {
       if (
-        !b ||
-        typeof b.id !== "string" ||
-        typeof b.text !== "string"
+        !block ||
+        typeof block.id !== "string" ||
+        typeof block.text !== "string"
       ) {
         continue;
       }
 
-      const id = b.id.slice(0, 80);
-      const text = b.text.trim().slice(0, 1800);
+      const id = block.id.slice(0, 100);
+      const text = block.text
+        .replace(/\s+/g, " ")
+        .trim()
+        .slice(0, 1800);
 
       if (!id || text.length < 10) continue;
 
       /*
-       * Allow a very large page overall, but keep the total request
-       * data within a practical range.
+       * Allow large pages, but prevent accidentally enormous
+       * requests from breaking the function.
        */
       if (totalChars + text.length > 240000) {
         break;
@@ -94,47 +88,50 @@ export default async function handler(req, res) {
 
     if (!safeBlocks.length) {
       return res.status(400).json({
-        error: "No readable page content was found"
+        error: "No usable page content was found"
       });
     }
 
     /*
-     * Split the page into search windows.
+     * ---------------------------------------------------------
+     * STAGE 1
      *
-     * Each AI request only sees ~30k characters instead of the
-     * entire page. This is what allows Snip to work on long pages.
+     * Split the page into manageable chunks and ask the model
+     * which passages are semantically relevant.
+     * ---------------------------------------------------------
      */
-    const CHUNK_CHARS = 30000;
+
+    const CHUNK_SIZE = 30000;
 
     const chunks = [];
-    let current = [];
-    let currentChars = 0;
+    let currentChunk = [];
+    let currentLength = 0;
 
     for (const block of safeBlocks) {
       if (
-        current.length &&
-        currentChars + block.text.length > CHUNK_CHARS
+        currentChunk.length &&
+        currentLength + block.text.length > CHUNK_SIZE
       ) {
-        chunks.push(current);
-        current = [];
-        currentChars = 0;
+        chunks.push(currentChunk);
+        currentChunk = [];
+        currentLength = 0;
       }
 
-      current.push(block);
-      currentChars += block.text.length;
+      currentChunk.push(block);
+      currentLength += block.text.length;
     }
 
-    if (current.length) {
-      chunks.push(current);
+    if (currentChunk.length) {
+      chunks.push(currentChunk);
     }
 
-    const schema = {
+    const candidateSchema = {
       type: "object",
       additionalProperties: false,
       properties: {
-        evidence: {
+        candidates: {
           type: "array",
-          maxItems: 2,
+          maxItems: 5,
           items: {
             type: "object",
             additionalProperties: false,
@@ -142,109 +139,45 @@ export default async function handler(req, res) {
               block_id: {
                 type: "string"
               },
-              text: {
+              reason: {
                 type: "string"
-              },
-              score: {
-                type: "number",
-                minimum: 0,
-                maximum: 1
               }
             },
             required: [
               "block_id",
-              "text",
-              "score"
+              "reason"
             ]
           }
         }
       },
       required: [
-        "evidence"
+        "candidates"
       ]
     };
 
-    function extractOutputText(data) {
-      if (
-        typeof data?.output_text === "string" &&
-        data.output_text.trim()
-      ) {
-        return data.output_text.trim();
-      }
-
-      const parts = [];
-
-      for (
-        const item of Array.isArray(data?.output)
-          ? data.output
-          : []
-      ) {
-        for (
-          const content of Array.isArray(item?.content)
-            ? item.content
-            : []
-        ) {
-          if (
-            content?.type === "output_text" &&
-            typeof content.text === "string"
-          ) {
-            parts.push(content.text);
-          }
-        }
-      }
-
-      return parts.join("\n").trim();
-    }
-
-    async function searchChunk(chunk) {
-      const source = chunk
-        .map(
-          b => `[${b.id}]\n${b.text}`
-        )
-        .join("\n\n");
-
-      const prompt = `You are Snip, an exact source locator.
-
-User question:
-${question}
-
-Your job is NOT to answer the question.
-
-Your job is to find the smallest passage or passages in this section that directly contain the information needed to answer the user's question.
-
-Rules:
-- Return at most 2 candidates.
-- block_id must exactly match one of the supplied block IDs.
-- text must be copied VERBATIM from that block.
-- Keep the selected text as short as possible while retaining the useful information.
-- Never paraphrase.
-- Never combine text from different blocks.
-- Never invent text.
-- score is your confidence from 0 to 1 that the passage directly answers the user's question.
-- If this section does not contain the answer, return an empty evidence array.
-
-SOURCE BLOCKS:
-
-${source}`;
-
+    async function askOpenAI({
+      prompt,
+      schema,
+      name,
+      maxOutputTokens
+    }) {
       const response = await fetch(
         "https://api.openai.com/v1/responses",
         {
           method: "POST",
           headers: {
             "Content-Type": "application/json",
-            "Authorization":
-              `Bearer ${process.env.OPENAI_API_KEY}`
+            "Authorization": `Bearer ${apiKey}`
           },
           body: JSON.stringify({
             model: "gpt-5-mini",
-            input: prompt,
             store: false,
-            max_output_tokens: 600,
+            input: prompt,
+            max_output_tokens: maxOutputTokens,
             text: {
               format: {
                 type: "json_schema",
-                name: "snip_evidence",
+                name,
                 strict: true,
                 schema
               }
@@ -257,11 +190,11 @@ ${source}`;
 
       if (!response.ok) {
         console.error(
-          "OpenAI chunk failed:",
-          raw.slice(0, 1000)
+          "OpenAI error:",
+          raw.slice(0, 1500)
         );
 
-        return [];
+        throw new Error("OpenAI request failed");
       }
 
       let data;
@@ -269,102 +202,399 @@ ${source}`;
       try {
         data = JSON.parse(raw);
       } catch {
-        return [];
+        throw new Error("Invalid OpenAI response");
       }
 
-      const output = extractOutputText(data);
+      let outputText = "";
 
-      if (!output) {
-        return [];
+      if (
+        typeof data.output_text === "string" &&
+        data.output_text.trim()
+      ) {
+        outputText = data.output_text.trim();
       }
 
-      let parsed;
+      if (!outputText && Array.isArray(data.output)) {
+        for (const item of data.output) {
+          if (!Array.isArray(item.content)) continue;
+
+          for (const content of item.content) {
+            if (
+              content?.type === "output_text" &&
+              typeof content.text === "string"
+            ) {
+              outputText += content.text;
+            }
+          }
+        }
+
+        outputText = outputText.trim();
+      }
+
+      if (!outputText) {
+        throw new Error("AI returned no usable output");
+      }
 
       try {
-        parsed = JSON.parse(output);
+        return JSON.parse(outputText);
       } catch {
         console.error(
-          "Invalid chunk JSON:",
-          output.slice(0, 500)
+          "AI returned invalid JSON:",
+          outputText.slice(0, 1000)
+        );
+
+        throw new Error("Invalid AI JSON response");
+      }
+    }
+
+    async function searchChunk(chunk) {
+      const source = chunk
+        .map(
+          block =>
+            `[${block.id}]\n${block.text}`
+        )
+        .join("\n\n");
+
+      const prompt = `
+You are the retrieval engine for Snip.
+
+Snip does NOT answer the user's question.
+
+Snip finds the exact part of the webpage that contains the answer.
+
+USER QUESTION:
+${question}
+
+PAGE CONTENT:
+
+${source}
+
+TASK:
+
+Find up to 5 blocks that are most likely to contain information needed to answer the user's question.
+
+The user's wording may be completely different from the wording on the page.
+
+For example:
+
+User:
+"How did Apollo 11 return to Earth?"
+
+Page:
+"The crew returned safely to Earth on July 24, splashing down in the Pacific Ocean."
+
+These are semantically related.
+
+Important rules:
+
+- Search by MEANING, not exact wording.
+- A candidate can be relevant even if it does not contain the same words as the question.
+- Only return block IDs that actually exist above.
+- Do not invent block IDs.
+- Do not answer the question.
+- Do not quote text.
+- If the section contains no useful information, return an empty candidates array.
+
+Return the strongest candidates.
+`;
+
+      try {
+        const result = await askOpenAI({
+          prompt,
+          schema: candidateSchema,
+          name: "snip_candidates",
+          maxOutputTokens: 700
+        });
+
+        return Array.isArray(result?.candidates)
+          ? result.candidates
+          : [];
+      } catch (error) {
+        console.error(
+          "Chunk search failed:",
+          error.message
         );
 
         return [];
       }
-
-      return Array.isArray(parsed?.evidence)
-        ? parsed.evidence
-        : [];
     }
 
     /*
-     * Search all chunks in parallel.
-     *
-     * This means a question about something near the very bottom
-     * of a huge webpage can still be found.
+     * Search all page chunks concurrently.
      */
-    const results = await Promise.all(
+    const chunkResults = await Promise.all(
       chunks.map(searchChunk)
     );
 
-    const candidates = results.flat();
+    /*
+     * Build a unique set of candidate block IDs.
+     */
+    const candidateIds = [];
+
+    for (const result of chunkResults) {
+      for (const candidate of result) {
+        if (
+          !candidate ||
+          typeof candidate.block_id !== "string"
+        ) {
+          continue;
+        }
+
+        if (
+          !candidateIds.includes(candidate.block_id)
+        ) {
+          candidateIds.push(candidate.block_id);
+        }
+      }
+    }
 
     /*
-     * Validate every AI result against the actual page text.
-     *
-     * This prevents the AI from returning text that cannot actually
-     * be highlighted on the webpage.
+     * Limit the final selection to the strongest set of blocks.
      */
-    const valid = candidates
-      .filter(
-        item =>
-          item &&
-          typeof item.block_id === "string" &&
-          typeof item.text === "string"
+    const candidateBlocks = candidateIds
+      .map(id =>
+        safeBlocks.find(
+          block => block.id === id
+        )
       )
-      .map(item => ({
-        block_id: item.block_id,
-        text: item.text.trim(),
-        score: Number.isFinite(Number(item.score))
-          ? Math.max(
-              0,
-              Math.min(1, Number(item.score))
-            )
-          : 0
-      }))
-      .filter(item => {
-        const block = safeBlocks.find(
-          b => b.id === item.block_id
-        );
+      .filter(Boolean)
+      .slice(0, 20);
 
-        return (
-          block &&
-          item.text &&
-          block.text.includes(item.text)
-        );
-      })
-      .sort(
-        (a, b) => b.score - a.score
-      )
-      .slice(0, 3)
+    if (!candidateBlocks.length) {
+      return res.status(200).json({
+        evidence: []
+      });
+    }
+
+    /*
+     * ---------------------------------------------------------
+     * STAGE 2
+     *
+     * Now that we have semantically relevant sections, ask the
+     * model to select the EXACT original wording.
+     * ---------------------------------------------------------
+     */
+
+    const finalSchema = {
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        evidence: {
+          type: "array",
+          maxItems: 3,
+          items: {
+            type: "object",
+            additionalProperties: false,
+            properties: {
+              block_id: {
+                type: "string"
+              },
+              text: {
+                type: "string"
+              }
+            },
+            required: [
+              "block_id",
+              "text"
+            ]
+          }
+        }
+      },
+      required: [
+        "evidence"
+      ]
+    };
+
+    const finalSource = candidateBlocks
       .map(
-        ({ block_id, text }) => ({
-          block_id,
-          text
-        })
+        block =>
+          `[${block.id}]\n${block.text}`
+      )
+      .join("\n\n");
+
+    const finalPrompt = `
+You are the final exact-location selector for Snip.
+
+USER QUESTION:
+${question}
+
+CANDIDATE PAGE BLOCKS:
+
+${finalSource}
+
+Your task is to identify the smallest passage or passages that directly contain the information needed to answer the question.
+
+CRITICAL:
+
+- Do NOT answer the question.
+- Return ORIGINAL text from the webpage.
+- The text must be copied VERBATIM from one of the supplied blocks.
+- Do not paraphrase.
+- Do not rewrite.
+- Do not combine separate blocks.
+- Do not invent words.
+- The selected text should normally be 1-3 sentences.
+- Prefer the smallest passage that gives the useful information.
+- You may return up to 3 passages.
+- If none of the candidate blocks actually answers the question, return an empty evidence array.
+
+The goal is for Snip to highlight this exact text on the original webpage.
+`;
+
+    let finalResult;
+
+    try {
+      finalResult = await askOpenAI({
+        prompt: finalPrompt,
+        schema: finalSchema,
+        name: "snip_exact_evidence",
+        maxOutputTokens: 1000
+      });
+    } catch (error) {
+      console.error(
+        "Final selection failed:",
+        error.message
       );
 
+      return res.status(200).json({
+        evidence: []
+      });
+    }
+
+    const proposed =
+      Array.isArray(finalResult?.evidence)
+        ? finalResult.evidence
+        : [];
+
+    /*
+     * ---------------------------------------------------------
+     * FINAL VALIDATION
+     *
+     * Never trust generated text blindly.
+     *
+     * Verify that the returned passage actually exists inside
+     * the original block, while allowing whitespace differences.
+     * ---------------------------------------------------------
+     */
+
+    function normalizeForMatch(value) {
+      return String(value || "")
+        .replace(/\s+/g, " ")
+        .trim()
+        .toLowerCase();
+    }
+
+    const evidence = [];
+
+    for (const item of proposed) {
+      if (
+        !item ||
+        typeof item.block_id !== "string" ||
+        typeof item.text !== "string"
+      ) {
+        continue;
+      }
+
+      const block = safeBlocks.find(
+        b => b.id === item.block_id
+      );
+
+      if (!block) continue;
+
+      const wanted = normalizeForMatch(
+        item.text
+      );
+
+      const actual = normalizeForMatch(
+        block.text
+      );
+
+      if (!wanted) continue;
+
+      /*
+       * Exact normalized containment.
+       */
+      if (actual.includes(wanted)) {
+        evidence.push({
+          block_id: block.id,
+          text: item.text.trim()
+        });
+
+        continue;
+      }
+
+      /*
+       * More tolerant matching for punctuation/formatting
+       * differences.
+       */
+      const words = wanted
+        .split(" ")
+        .filter(Boolean);
+
+      if (words.length >= 5) {
+        let cursor = 0;
+        let matched = true;
+
+        for (const word of words) {
+          const position = actual.indexOf(
+            word,
+            cursor
+          );
+
+          if (position === -1) {
+            matched = false;
+            break;
+          }
+
+          cursor = position + word.length;
+        }
+
+        if (matched) {
+          /*
+           * Use the original block text rather than invented
+           * text if the model's formatting differed.
+           */
+          evidence.push({
+            block_id: block.id,
+            text: block.text
+          });
+        }
+      }
+    }
+
+    /*
+     * Remove duplicate evidence.
+     */
+    const uniqueEvidence = [];
+
+    for (const item of evidence) {
+      const duplicate =
+        uniqueEvidence.some(
+          existing =>
+            existing.block_id === item.block_id &&
+            normalizeForMatch(existing.text) ===
+              normalizeForMatch(item.text)
+        );
+
+      if (!duplicate) {
+        uniqueEvidence.push(item);
+      }
+    }
+
     return res.status(200).json({
-      evidence: valid
+      evidence: uniqueEvidence.slice(0, 3)
     });
 
   } catch (error) {
     console.error(
-      "FUNCTION ERROR:",
+      "Snip API error:",
       error
     );
 
     return res.status(500).json({
-      error: "Function failed"
+      error:
+        error?.message ||
+        "Something went wrong"
     });
   }
 }
