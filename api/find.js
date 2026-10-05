@@ -9,7 +9,9 @@ export default async function handler(req, res) {
   }
 
   if (req.method !== "POST") {
-    return res.status(405).json({ error: "Method not allowed" });
+    return res.status(405).json({
+      error: "Method not allowed"
+    });
   }
 
   try {
@@ -55,21 +57,21 @@ export default async function handler(req, res) {
       });
     }
 
-    // Clean and limit incoming page blocks.
+    // Clean the page while preserving the original text.
     const safeBlocks = [];
     let totalChars = 0;
 
-    for (const b of blocks) {
+    for (const block of blocks) {
       if (
-        !b ||
-        typeof b.id !== "string" ||
-        typeof b.text !== "string"
+        !block ||
+        typeof block.id !== "string" ||
+        typeof block.text !== "string"
       ) {
         continue;
       }
 
-      const id = b.id.slice(0, 80);
-      const text = b.text.trim().slice(0, 1800);
+      const id = block.id.slice(0, 80);
+      const text = block.text.trim().slice(0, 1800);
 
       if (!id || text.length < 10) {
         continue;
@@ -94,33 +96,22 @@ export default async function handler(req, res) {
     }
 
     /*
-     * Split the page into independent search windows.
-     * This allows Snip to handle long webpages without putting
-     * the entire page into a single AI request.
+     * IMPORTANT:
+     *
+     * We intentionally send the page as ONE connected document.
+     *
+     * Snip should understand relationships between sections instead
+     * of independently asking an AI model about isolated chunks.
      */
-    const CHUNK_CHARS = 30000;
-
-    const chunks = [];
-    let current = [];
-    let currentChars = 0;
-
-    for (const block of safeBlocks) {
-      if (
-        current.length &&
-        currentChars + block.text.length > CHUNK_CHARS
-      ) {
-        chunks.push(current);
-        current = [];
-        currentChars = 0;
-      }
-
-      current.push(block);
-      currentChars += block.text.length;
-    }
-
-    if (current.length) {
-      chunks.push(current);
-    }
+    const source = safeBlocks
+      .map(
+        (block, index) =>
+          `[BLOCK ${index}]
+ID: ${block.id}
+TEXT:
+${block.text}`
+      )
+      .join("\n\n");
 
     const schema = {
       type: "object",
@@ -158,6 +149,125 @@ export default async function handler(req, res) {
       ]
     };
 
+    const prompt = `
+You are Snip, an AI-powered precision navigation system.
+
+You are looking at the COMPLETE readable content of a webpage.
+
+USER QUESTION:
+${question}
+
+YOUR TASK:
+
+Understand the meaning of the user's question and understand the webpage as a whole.
+
+Then identify the smallest useful passage on the ORIGINAL webpage that contains the information needed to answer the question.
+
+IMPORTANT:
+
+The user's wording does NOT need to appear in the webpage.
+
+Use semantic understanding.
+
+For example:
+
+Question:
+"Who were the astronauts?"
+
+Page:
+"The mission was crewed by Commander Neil Armstrong, Command Module Pilot Michael Collins, and Lunar Module Pilot Edwin 'Buzz' Aldrin."
+
+This is relevant even though the word "astronauts" does not appear in that passage.
+
+Another example:
+
+Question:
+"What happened after they landed?"
+
+The page might say:
+"After more than 21 hours on the surface, they rejoined Collins in lunar orbit."
+
+Understand that this describes what happened after the lunar landing even if those exact words are not present.
+
+RULES:
+
+1. Understand the entire page before choosing evidence.
+2. Use the question's meaning, not exact keyword matching.
+3. Use context from other parts of the page when deciding what a passage means.
+4. Prefer the smallest passage that actually contains the answer.
+5. Return at most 2 passages.
+6. block_id MUST exactly match one of the supplied block IDs.
+7. text MUST be copied VERBATIM from that block.
+8. Do not paraphrase the returned text.
+9. Do not invent text.
+10. Do not combine text from different blocks into one text field.
+11. If a question is answered by one paragraph, prefer that paragraph over several unrelated snippets.
+12. If the page does not contain enough information to answer the question, return an empty evidence array.
+13. score represents confidence that the selected passage directly answers the user's question.
+
+The goal is NOT to answer the user in your own words.
+
+The goal is to FIND WHERE THE ANSWER IS ON THE ORIGINAL PAGE.
+
+COMPLETE WEBPAGE:
+
+${source}
+`;
+
+    const response = await fetch(
+      "https://api.openai.com/v1/responses",
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization":
+            `Bearer ${process.env.OPENAI_API_KEY}`
+        },
+        body: JSON.stringify({
+          model: "gpt-5-mini",
+          input: prompt,
+          store: false,
+          max_output_tokens: 1000,
+          text: {
+            format: {
+              type: "json_schema",
+              name: "snip_evidence",
+              strict: true,
+              schema
+            }
+          }
+        })
+      }
+    );
+
+    const raw = await response.text();
+
+    if (!response.ok) {
+      console.error(
+        "OpenAI request failed:",
+        raw.slice(0, 2000)
+      );
+
+      return res.status(502).json({
+        error: "OpenAI request failed"
+      });
+    }
+
+    let data;
+
+    try {
+      data = JSON.parse(raw);
+    } catch (error) {
+      console.error(
+        "Could not parse OpenAI response:",
+        raw.slice(0, 2000)
+      );
+
+      return res.status(502).json({
+        error: "Invalid OpenAI response"
+      });
+    }
+
     function extractOutputText(data) {
       if (
         typeof data?.output_text === "string" &&
@@ -190,127 +300,37 @@ export default async function handler(req, res) {
       return parts.join("\n").trim();
     }
 
-    async function searchChunk(chunk) {
-      const source = chunk
-        .map(
-          (b) =>
-            `[${b.id}]\n${b.text}`
-        )
-        .join("\n\n");
+    const output = extractOutputText(data);
 
-      const prompt = `
-You are Snip, an exact source locator.
-
-User question:
-${question}
-
-Your job is NOT to answer the question.
-
-Your job is to find the smallest passage or passages in this section that directly contain the information needed to answer the user's question.
-
-Rules:
-
-- Return at most 2 candidates.
-- block_id must exactly match a supplied block ID.
-- text must be copied VERBATIM from that block.
-- Keep text as short as possible while retaining the useful information.
-- Never paraphrase.
-- Never combine text from different blocks.
-- Never invent text.
-- score is your confidence from 0 to 1 that the passage directly answers the user's question.
-- If this section does not contain the answer, return an empty evidence array.
-
-SOURCE BLOCKS:
-
-${source}
-`;
-
-      const response = await fetch(
-        "https://api.openai.com/v1/responses",
-        {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            "Authorization":
-              `Bearer ${process.env.OPENAI_API_KEY}`
-          },
-          body: JSON.stringify({
-            model: "gpt-5-mini",
-            input: prompt,
-            store: false,
-            max_output_tokens: 600,
-            text: {
-              format: {
-                type: "json_schema",
-                name: "snip_evidence",
-                strict: true,
-                schema
-              }
-            }
-          })
-        }
-      );
-
-      const raw = await response.text();
-
-      if (!response.ok) {
-        console.error(
-          "OpenAI chunk failed:",
-          raw.slice(0, 1000)
-        );
-
-        return [];
-      }
-
-      let data;
-
-      try {
-        data = JSON.parse(raw);
-      } catch (error) {
-        console.error(
-          "Could not parse OpenAI response:",
-          error
-        );
-
-        return [];
-      }
-
-      const output = extractOutputText(data);
-
-      if (!output) {
-        return [];
-      }
-
-      let parsed;
-
-      try {
-        parsed = JSON.parse(output);
-      } catch (error) {
-        console.error(
-          "Invalid chunk JSON:",
-          output.slice(0, 500)
-        );
-
-        return [];
-      }
-
-      return Array.isArray(parsed?.evidence)
-        ? parsed.evidence
-        : [];
+    if (!output) {
+      return res.status(200).json({
+        evidence: []
+      });
     }
 
-    /*
-     * Search all page sections in parallel.
-     */
-    const results = await Promise.all(
-      chunks.map(searchChunk)
-    );
+    let parsed;
 
-    const candidates = results.flat();
+    try {
+      parsed = JSON.parse(output);
+    } catch (error) {
+      console.error(
+        "Invalid structured output:",
+        output.slice(0, 2000)
+      );
+
+      return res.status(502).json({
+        error: "Invalid AI result"
+      });
+    }
+
+    const candidates = Array.isArray(parsed?.evidence)
+      ? parsed.evidence
+      : [];
 
     /*
-     * Validate every returned passage against the original
-     * page text before sending it back to the extension.
+     * Validate the AI's selected passages against the actual
+     * webpage content. This prevents hallucinated text from
+     * ever being sent to the extension.
      */
     const valid = candidates
       .filter(
@@ -322,9 +342,7 @@ ${source}
       .map((item) => ({
         block_id: item.block_id,
         text: item.text.trim(),
-        score: Number.isFinite(
-          Number(item.score)
-        )
+        score: Number.isFinite(Number(item.score))
           ? Math.max(
               0,
               Math.min(
@@ -339,16 +357,16 @@ ${source}
           (b) => b.id === item.block_id
         );
 
-        return (
-          block &&
-          item.text &&
-          block.text.includes(item.text)
-        );
+        if (!block || !item.text) {
+          return false;
+        }
+
+        return block.text.includes(item.text);
       })
       .sort(
         (a, b) => b.score - a.score
       )
-      .slice(0, 3)
+      .slice(0, 2)
       .map(({ block_id, text }) => ({
         block_id,
         text
@@ -365,11 +383,7 @@ ${source}
     );
 
     return res.status(500).json({
-      error: "Function failed",
-      details:
-        process.env.NODE_ENV === "development"
-          ? String(error?.message || error)
-          : undefined
+      error: "Function failed"
     });
   }
 }
