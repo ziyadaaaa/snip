@@ -11,7 +11,9 @@ export default async function handler(req, res) {
   }
 
   if (req.method !== "POST") {
-    return res.status(405).json({ error: "Method not allowed" });
+    return res.status(405).json({
+      error: "Method not allowed"
+    });
   }
 
   try {
@@ -31,9 +33,14 @@ export default async function handler(req, res) {
 
     const cleanedBlocks = blocks
       .map((block, i) => ({
-        index: Number.isInteger(block?.index) ? block.index : i,
+        index: Number.isInteger(block?.index)
+          ? block.index
+          : i,
+
         text: String(block?.text || "").trim(),
+
         kind: block?.kind || "text",
+
         section: block?.section || ""
       }))
       .filter(block => block.text.length > 0);
@@ -79,10 +86,10 @@ export default async function handler(req, res) {
     }
 
     // Keep enough context for long pages.
-    // But send sentences rather than huge paragraphs.
     const MAX_SENTENCES = 700;
 
-    const sentenceCandidates = sentences.slice(0, MAX_SENTENCES);
+    const sentenceCandidates =
+      sentences.slice(0, MAX_SENTENCES);
 
     // --------------------------------------------------
     // Detect question intent
@@ -111,8 +118,6 @@ export default async function handler(req, res) {
 
     // --------------------------------------------------
     // Add deterministic hints.
-    // These do NOT answer the question.
-    // They only help the model choose the right sentence.
     // --------------------------------------------------
 
     const candidateText = sentenceCandidates
@@ -123,13 +128,33 @@ export default async function handler(req, res) {
 
         if (isDuration) {
           if (
-            /\b\d+(?:\.\d+)?\s*(hours?|hrs?|minutes?|mins?|days?|weeks?|months?|years?)\b/.test(s) ||
+            /\d+(?:\.\d+)?\s*(hours?|hrs?|minutes?|mins?|days?|weeks?|months?|years?)\b/.test(s) ||
             /\bmore than\b/.test(s) ||
             /\bless than\b/.test(s) ||
             /\bapproximately\b/.test(s) ||
             /\babout\b/.test(s)
           ) {
             hint = " [DURATION-CANDIDATE]";
+          }
+
+          // Explicitly mark activity durations as weaker.
+          if (
+            /\ballotted\b/.test(s) ||
+            /\bsample collection\b/.test(s) ||
+            /\bdocumenting\b/.test(s) ||
+            /\bhalfway\b/.test(s) ||
+            /\bactivity\b/.test(s)
+          ) {
+            hint += " [ACTIVITY-DURATION]";
+          }
+
+          // Strong signal for total lunar/surface stay.
+          if (
+            /\bon the lunar surface\b/.test(s) ||
+            /\bon the surface\b/.test(s) ||
+            /\bon the moon\b/.test(s)
+          ) {
+            hint += " [SURFACE-STAY]";
           }
         }
 
@@ -140,14 +165,11 @@ export default async function handler(req, res) {
             /\bdescended\b/.test(s) ||
             /\barrived\b/.test(s) ||
             /\breached\b/.test(s) ||
-            /\breached\b/.test(s) ||
             /\btouched down\b/.test(s)
           ) {
             hint += " [LOCATION-CANDIDATE]";
           }
 
-          // Explicitly discourage "saw the landing site"
-          // when the user asks where they landed.
           if (
             /\bsaw\b/.test(s) &&
             /\blanding site\b/.test(s)
@@ -170,7 +192,7 @@ export default async function handler(req, res) {
       .join("\n\n");
 
     // --------------------------------------------------
-    // Ask OpenAI for the EXACT answer sentence.
+    // Ask OpenAI for EXACT answer sentence.
     // --------------------------------------------------
 
     const prompt = `
@@ -191,18 +213,27 @@ CRITICAL RULES:
 4. Do NOT combine multiple unrelated sentences.
 5. Do NOT choose a sentence merely because it contains related words.
 6. Choose the sentence that actually answers the question.
+7. The passage MUST be copied exactly from the webpage.
 
 QUESTION TYPE RULES:
 
 If the question asks "HOW LONG":
-- Prefer the sentence containing the actual duration.
+
+- Prefer the sentence containing the actual duration of the event, stay, journey, or period being asked about.
 - Look for hours, minutes, days, weeks, months, years, etc.
-- Do NOT choose a sentence describing what happened afterward.
+- Determine WHAT the duration refers to.
+- Do NOT confuse the duration of a small activity with the duration of the overall event.
+- If the question asks how long people stayed somewhere, prefer a sentence explicitly describing their time at that location.
 - For example, if the page says:
-  "After more than 21 hours on the lunar surface, they rejoined Collins..."
-  that sentence is the correct evidence for "How long did they stay on the Moon?"
+  "After more than 21 hours on the surface, they rejoined Collins in lunar orbit..."
+  that is the correct evidence for:
+  "How long did the astronauts stay on the Moon?"
+- A sentence such as:
+  "they had to stop documenting sample collection halfway through the allotted 34 minutes."
+  is NOT the answer to the total-stay question because 34 minutes describes an individual activity.
 
 If the question asks "WHERE":
+
 - Choose the sentence describing where the event actually occurred.
 - Prefer sentences containing "landed", "landing", "descended", "arrived", "reached", or "touched down".
 - Do NOT choose a sentence merely saying people later saw, viewed, mapped, or observed the location.
@@ -212,12 +243,12 @@ If the question asks "WHERE":
 - A sentence saying "the crew saw passing views of their landing site..." is NOT the answer.
 
 If the question asks WHO:
+
 - Choose the sentence that explicitly identifies the person.
 
 If the question asks WHEN:
-- Choose the sentence containing the relevant date/time/event timing.
 
-The returned sentence MUST be copied EXACTLY from the supplied webpage text.
+- Choose the sentence containing the relevant date, time, or event timing.
 
 Return JSON only in this format:
 
@@ -237,17 +268,21 @@ WEBPAGE SENTENCES:
 ${candidateText}
 `;
 
-    const response = await callOpenAI(apiKey, prompt);
+    const response =
+      await callOpenAI(apiKey, prompt);
 
-    const parsed = parseModelJSON(response);
+    const parsed =
+      parseModelJSON(response);
 
-    if (!parsed || !Array.isArray(parsed.evidence)) {
+    if (
+      !parsed ||
+      !Array.isArray(parsed.evidence)
+    ) {
       throw new Error("Invalid model response");
     }
 
     // --------------------------------------------------
-    // Validate that returned evidence really exists
-    // in the original page block.
+    // Validate returned evidence.
     // --------------------------------------------------
 
     const validEvidence = [];
@@ -255,20 +290,32 @@ ${candidateText}
     for (const item of parsed.evidence.slice(0, 2)) {
       if (!item) continue;
 
-      const blockIndex = Number(item.block_index);
-      const passage = String(item.passage || "").trim();
+      const blockIndex =
+        Number(item.block_index);
 
-      if (!Number.isInteger(blockIndex) || !passage) {
+      const passage =
+        String(item.passage || "").trim();
+
+      if (
+        !Number.isInteger(blockIndex) ||
+        !passage
+      ) {
         continue;
       }
 
-      const sourceBlock = cleanedBlocks.find(
-        block => block.index === blockIndex
-      );
+      const sourceBlock =
+        cleanedBlocks.find(
+          block => block.index === blockIndex
+        );
 
       if (!sourceBlock) continue;
 
-      if (containsEquivalentText(sourceBlock.text, passage)) {
+      if (
+        containsEquivalentText(
+          sourceBlock.text,
+          passage
+        )
+      ) {
         validEvidence.push({
           block_index: blockIndex,
           passage
@@ -277,15 +324,21 @@ ${candidateText}
     }
 
     // --------------------------------------------------
-    // Deterministic fallback for obvious duration/location
-    // questions if AI selected a nearby sentence.
+    // Precision override
     // --------------------------------------------------
 
-    if (validEvidence.length === 0 || needsPrecisionOverride(validEvidence, question)) {
-      const fallback = findBestDeterministicSentence(
-        question,
-        cleanedBlocks
-      );
+    if (
+      validEvidence.length === 0 ||
+      needsPrecisionOverride(
+        validEvidence,
+        question
+      )
+    ) {
+      const fallback =
+        findBestDeterministicSentence(
+          question,
+          cleanedBlocks
+        );
 
       if (fallback) {
         return res.status(200).json({
@@ -299,7 +352,10 @@ ${candidateText}
     });
 
   } catch (error) {
-    console.error("FUNCTION ERROR:", error);
+    console.error(
+      "FUNCTION ERROR:",
+      error
+    );
 
     return res.status(500).json({
       error: "Function failed"
@@ -312,14 +368,19 @@ ${candidateText}
 // OpenAI
 // ======================================================
 
-async function callOpenAI(apiKey, prompt) {
+async function callOpenAI(
+  apiKey,
+  prompt
+) {
   const body = {
     model: "gpt-5-mini",
+
     store: false,
 
     input: [
       {
         role: "user",
+
         content: [
           {
             type: "input_text",
@@ -334,42 +395,58 @@ async function callOpenAI(apiKey, prompt) {
     text: {
       format: {
         type: "json_schema",
+
         name: "snip_evidence",
+
         strict: true,
+
         schema: {
           type: "object",
+
           properties: {
             evidence: {
               type: "array",
+
               maxItems: 2,
+
               items: {
                 type: "object",
+
                 properties: {
                   block_index: {
                     type: "integer"
                   },
+
                   passage: {
                     type: "string"
                   }
                 },
+
                 required: [
                   "block_index",
                   "passage"
                 ],
+
                 additionalProperties: false
               }
             }
           },
+
           required: [
             "evidence"
           ],
+
           additionalProperties: false
         }
       }
     }
   };
 
-  for (let attempt = 0; attempt < 3; attempt++) {
+  for (
+    let attempt = 0;
+    attempt < 3;
+    attempt++
+  ) {
     const response = await fetch(
       "https://api.openai.com/v1/responses",
       {
@@ -384,7 +461,8 @@ async function callOpenAI(apiKey, prompt) {
       }
     );
 
-    const text = await response.text();
+    const text =
+      await response.text();
 
     if (!response.ok) {
       console.error(
@@ -397,11 +475,16 @@ async function callOpenAI(apiKey, prompt) {
         response.status === 429 ||
         response.status >= 500
       ) {
-        await sleep(700 * (attempt + 1));
+        await sleep(
+          700 * (attempt + 1)
+        );
+
         continue;
       }
 
-      throw new Error("OpenAI API failed");
+      throw new Error(
+        "OpenAI API failed"
+      );
     }
 
     let data;
@@ -409,24 +492,37 @@ async function callOpenAI(apiKey, prompt) {
     try {
       data = JSON.parse(text);
     } catch {
-      throw new Error("Invalid OpenAI response");
+      throw new Error(
+        "Invalid OpenAI response"
+      );
     }
 
-    const outputText = extractOutputText(data);
+    const outputText =
+      extractOutputText(data);
 
-    if (outputText && outputText.trim()) {
+    if (
+      outputText &&
+      outputText.trim()
+    ) {
       return outputText;
     }
 
     console.error(
       "Empty OpenAI response:",
-      JSON.stringify(data).slice(0, 4000)
+      JSON.stringify(data).slice(
+        0,
+        4000
+      )
     );
 
-    await sleep(500 * (attempt + 1));
+    await sleep(
+      500 * (attempt + 1)
+    );
   }
 
-  throw new Error("Empty OpenAI response");
+  throw new Error(
+    "Empty OpenAI response"
+  );
 }
 
 
@@ -444,8 +540,12 @@ function extractOutputText(data) {
 
   const parts = [];
 
-  for (const output of data?.output || []) {
-    for (const content of output?.content || []) {
+  for (
+    const output of data?.output || []
+  ) {
+    for (
+      const content of output?.content || []
+    ) {
       if (
         typeof content?.text === "string" &&
         content.text.trim()
@@ -468,14 +568,17 @@ function parseModelJSON(text) {
     return JSON.parse(text);
   } catch {}
 
-  const match = text.match(/\{[\s\S]*\}/);
+  const match =
+    text.match(/\{[\s\S]*\}/);
 
   if (!match) {
     return null;
   }
 
   try {
-    return JSON.parse(match[0]);
+    return JSON.parse(
+      match[0]
+    );
   } catch {
     return null;
   }
@@ -495,11 +598,10 @@ function splitIntoSentences(text) {
     return [];
   }
 
-  // Handles normal punctuation while avoiding
-  // destroying common abbreviations/numbers.
-  const matches = normalized.match(
-    /[^.!?]+(?:[.!?]+(?=\s|$)|$)/g
-  );
+  const matches =
+    normalized.match(
+      /[^.!?]+(?:[.!?]+(?=\s|$)|$)/g
+    );
 
   return matches || [normalized];
 }
@@ -512,18 +614,36 @@ function splitIntoSentences(text) {
 function normalizeText(text) {
   return String(text || "")
     .normalize("NFKC")
-    .replace(/[“”„‟]/g, '"')
-    .replace(/[‘’‚‛]/g, "'")
-    .replace(/\u00a0/g, " ")
-    .replace(/\s+/g, " ")
+    .replace(
+      /[“”„‟]/g,
+      '"'
+    )
+    .replace(
+      /[‘’‚‛]/g,
+      "'"
+    )
+    .replace(
+      /\u00a0/g,
+      " "
+    )
+    .replace(
+      /\s+/g,
+      " "
+    )
     .trim()
     .toLowerCase();
 }
 
 
-function containsEquivalentText(source, passage) {
-  const a = normalizeText(source);
-  const b = normalizeText(passage);
+function containsEquivalentText(
+  source,
+  passage
+) {
+  const a =
+    normalizeText(source);
+
+  const b =
+    normalizeText(passage);
 
   if (!a || !b) {
     return false;
@@ -533,11 +653,21 @@ function containsEquivalentText(source, passage) {
     return true;
   }
 
-  // More tolerant comparison for punctuation differences.
-  const compactA = a.replace(/[^\p{L}\p{N}]+/gu, "");
-  const compactB = b.replace(/[^\p{L}\p{N}]+/gu, "");
+  const compactA =
+    a.replace(
+      /[^\p{L}\p{N}]+/gu,
+      ""
+    );
 
-  return compactA.includes(compactB);
+  const compactB =
+    b.replace(
+      /[^\p{L}\p{N}]+/gu,
+      ""
+    );
+
+  return compactA.includes(
+    compactB
+  );
 }
 
 
@@ -545,17 +675,24 @@ function containsEquivalentText(source, passage) {
 // Precision override
 // ======================================================
 
-function needsPrecisionOverride(evidence, question) {
+function needsPrecisionOverride(
+  evidence,
+  question
+) {
   if (!evidence.length) {
     return true;
   }
 
-  const q = question.toLowerCase();
+  const q =
+    question.toLowerCase();
 
-  const passage = evidence[0].passage.toLowerCase();
+  const passage =
+    evidence[0].passage.toLowerCase();
 
-  // Duration question selected something without
-  // a duration expression.
+  // --------------------------------------------
+  // Duration questions
+  // --------------------------------------------
+
   if (/\bhow long\b/.test(q)) {
     const hasDuration =
       /\b\d+(?:\.\d+)?\s*(hours?|hrs?|minutes?|mins?|days?|weeks?|months?|years?)\b/.test(passage) ||
@@ -565,14 +702,54 @@ function needsPrecisionOverride(evidence, question) {
     if (!hasDuration) {
       return true;
     }
+
+    // Reject durations belonging to a small activity.
+    const activityDuration =
+      /\ballotted\b/.test(passage) ||
+      /\ballotted time\b/.test(passage) ||
+      /\ballocated\b/.test(passage) ||
+      /\bactivity\b/.test(passage) ||
+      /\bsample collection\b/.test(passage) ||
+      /\bexperiment\b/.test(passage) ||
+      /\bdocumenting\b/.test(passage) ||
+      /\bminutes?\b/.test(passage) &&
+      (
+        /\bstop\b/.test(passage) ||
+        /\bhalfway\b/.test(passage) ||
+        /\bcollection\b/.test(passage)
+      );
+
+    if (activityDuration) {
+      return true;
+    }
+
+    // If asking how long someone stayed somewhere,
+    // require evidence that describes that stay.
+    const describesSurfaceStay =
+      /\bon the (?:lunar )?surface\b/.test(passage) ||
+      /\bon the moon\b/.test(passage) ||
+      /\bon the lunar surface\b/.test(passage) ||
+      /\blunar stay\b/.test(passage);
+
+    if (!describesSurfaceStay) {
+      return true;
+    }
   }
 
-  // Location question selected an observation sentence
-  // instead of the actual landing/event sentence.
+  // --------------------------------------------
+  // Location questions
+  // --------------------------------------------
+
   if (/\bwhere\b/.test(q)) {
     if (
       /\bsaw\b/.test(passage) &&
       /\blanding site\b/.test(passage)
+    ) {
+      return true;
+    }
+
+    if (
+      /\bpassing views\b/.test(passage)
     ) {
       return true;
     }
@@ -586,14 +763,22 @@ function needsPrecisionOverride(evidence, question) {
 // Deterministic fallback
 // ======================================================
 
-function findBestDeterministicSentence(question, blocks) {
-  const q = question.toLowerCase();
+function findBestDeterministicSentence(
+  question,
+  blocks
+) {
+  const q =
+    question.toLowerCase();
 
   const sentences = [];
 
   for (const block of blocks) {
-    for (const sentence of splitIntoSentences(block.text)) {
-      const clean = sentence.trim();
+    for (
+      const sentence of
+      splitIntoSentences(block.text)
+    ) {
+      const clean =
+        sentence.trim();
 
       if (!clean) continue;
 
@@ -611,8 +796,10 @@ function findBestDeterministicSentence(question, blocks) {
 
   if (/\bhow long\b/.test(q)) {
     for (const item of sentences) {
-      const s = item.passage.toLowerCase();
+      const s =
+        item.passage.toLowerCase();
 
+      // Any explicit duration.
       if (
         /\b\d+(?:\.\d+)?\s*(hours?|hrs?|minutes?|mins?|days?|weeks?|months?|years?)\b/.test(s)
       ) {
@@ -627,20 +814,63 @@ function findBestDeterministicSentence(question, blocks) {
         item.score += 20;
       }
 
-      if (/\bon the (?:lunar|moon)\b/.test(s)) {
-        item.score += 20;
+      // Strong signal for total time on the Moon.
+      if (
+        /\bon the (?:lunar )?surface\b/.test(s)
+      ) {
+        item.score += 70;
+      }
+
+      if (/\bon the moon\b/.test(s)) {
+        item.score += 70;
       }
 
       if (/\blunar surface\b/.test(s)) {
-        item.score += 30;
+        item.score += 40;
       }
 
-      // Strong penalty for unrelated later events.
+      // Especially strong combination:
+      // "After more than 21 hours on the surface..."
+      if (
+        /\bafter\b/.test(s) &&
+        /\bhours?\b/.test(s) &&
+        /\bsurface\b/.test(s)
+      ) {
+        item.score += 80;
+      }
+
+      // ----------------------------------------
+      // Penalize activity durations.
+      // ----------------------------------------
+
+      if (/\ballotted\b/.test(s)) {
+        item.score -= 100;
+      }
+
+      if (/\bsample collection\b/.test(s)) {
+        item.score -= 100;
+      }
+
+      if (/\bdocumenting\b/.test(s)) {
+        item.score -= 80;
+      }
+
+      if (/\bhalfway\b/.test(s)) {
+        item.score -= 80;
+      }
+
+      if (/\bactivity\b/.test(s)) {
+        item.score -= 60;
+      }
+
+      // Later events are weaker evidence.
       if (/\brejoined\b/.test(s)) {
         item.score -= 15;
       }
 
-      if (/\breturned safely to earth\b/.test(s)) {
+      if (
+        /\breturned safely to earth\b/.test(s)
+      ) {
         item.score -= 30;
       }
     }
@@ -652,7 +882,8 @@ function findBestDeterministicSentence(question, blocks) {
 
   if (/\bwhere\b/.test(q)) {
     for (const item of sentences) {
-      const s = item.passage.toLowerCase();
+      const s =
+        item.passage.toLowerCase();
 
       if (/\blanding in\b/.test(s)) {
         item.score += 120;
@@ -662,7 +893,9 @@ function findBestDeterministicSentence(question, blocks) {
         item.score += 120;
       }
 
-      if (/\bdescended to the surface\b/.test(s)) {
+      if (
+        /\bdescended to the surface\b/.test(s)
+      ) {
         item.score += 80;
       }
 
@@ -670,12 +903,13 @@ function findBestDeterministicSentence(question, blocks) {
         item.score += 100;
       }
 
-      if (/\bsea of tranquility\b/.test(s)) {
+      if (
+        /\bsea of tranquility\b/.test(s)
+      ) {
         item.score += 50;
       }
 
-      // This is specifically NOT the answer
-      // to "where did they land?"
+      // Not the actual landing.
       if (
         /\bsaw\b/.test(s) &&
         /\blanding site\b/.test(s)
@@ -689,14 +923,23 @@ function findBestDeterministicSentence(question, blocks) {
     }
   }
 
-  const best = sentences
-    .filter(item => item.score > 0)
-    .sort((a, b) => b.score - a.score)[0];
+  const best =
+    sentences
+      .filter(
+        item => item.score > 0
+      )
+      .sort(
+        (a, b) =>
+          b.score - a.score
+      )[0];
 
   return best
     ? {
-        block_index: best.block_index,
-        passage: best.passage
+        block_index:
+          best.block_index,
+
+        passage:
+          best.passage
       }
     : null;
 }
@@ -707,5 +950,8 @@ function findBestDeterministicSentence(question, blocks) {
 // ======================================================
 
 function sleep(ms) {
-  return new Promise(resolve => setTimeout(resolve, ms));
+  return new Promise(
+    resolve =>
+      setTimeout(resolve, ms)
+  );
 }
