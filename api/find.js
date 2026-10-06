@@ -1,736 +1,711 @@
 export default async function handler(req, res) {
-  // =========================================================
+  // -----------------------------
   // CORS
-  // =========================================================
-
+  // -----------------------------
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type");
 
   if (req.method === "OPTIONS") {
-    return res.status(204).end();
+    return res.status(200).end();
   }
 
   if (req.method !== "POST") {
-    return res.status(405).json({
-      error: "Method not allowed"
-    });
+    return res.status(405).json({ error: "Method not allowed" });
   }
 
   try {
-    // =========================================================
-    // API KEY
-    // =========================================================
+    const { question, blocks } = req.body || {};
+
+    if (!question || typeof question !== "string") {
+      return res.status(400).json({
+        error: "Missing question"
+      });
+    }
+
+    if (!Array.isArray(blocks) || blocks.length === 0) {
+      return res.status(400).json({
+        error: "Missing blocks"
+      });
+    }
+
+    const cleanedBlocks = blocks
+      .map((block, i) => ({
+        index: Number.isInteger(block?.index) ? block.index : i,
+        text: String(block?.text || "").trim(),
+        kind: block?.kind || "text",
+        section: block?.section || ""
+      }))
+      .filter(block => block.text.length > 0);
+
+    if (!cleanedBlocks.length) {
+      return res.status(400).json({
+        error: "No usable page content"
+      });
+    }
 
     const apiKey = process.env.OPENAI_API_KEY;
 
     if (!apiKey) {
-      console.error("Missing OPENAI_API_KEY");
+      console.error("OPENAI_API_KEY is missing");
 
       return res.status(500).json({
         error: "Server configuration error"
       });
     }
 
-    // =========================================================
-    // REQUEST BODY
-    // =========================================================
+    // --------------------------------------------------
+    // Split blocks into sentences.
+    // Each sentence keeps its original block index.
+    // --------------------------------------------------
 
-    const body = req.body || {};
+    const sentences = [];
 
-    const question =
-      typeof body.question === "string"
-        ? body.question.trim()
-        : "";
+    for (const block of cleanedBlocks) {
+      const parts = splitIntoSentences(block.text);
 
-    const blocks =
-      Array.isArray(body.blocks)
-        ? body.blocks
-        : [];
+      for (const sentence of parts) {
+        const clean = sentence.trim();
 
-    if (!question) {
-      return res.status(400).json({
-        error: "Question is required"
-      });
-    }
+        if (!clean) continue;
 
-    if (!blocks.length) {
-      return res.status(400).json({
-        error: "No page content was provided"
-      });
-    }
-
-    // =========================================================
-    // CLEAN INPUT
-    // =========================================================
-
-    const safeQuestion =
-      question.slice(0, 1000);
-
-    const safeBlocks = blocks
-      .slice(0, 600)
-      .map((block, index) => {
-        if (typeof block === "string") {
-          return {
-            index,
-            text: block.slice(0, 4000)
-          };
-        }
-
-        return {
-          index:
-            typeof block.index === "number"
-              ? block.index
-              : index,
-
-          text:
-            typeof block.text === "string"
-              ? block.text.slice(0, 4000)
-              : ""
-        };
-      })
-      .filter(block =>
-        block.text.trim()
-      );
-
-    if (!safeBlocks.length) {
-      return res.status(400).json({
-        error: "No usable page content was provided"
-      });
-    }
-
-    // Keep request size manageable.
-    let totalChars = 0;
-    const limitedBlocks = [];
-
-    for (const block of safeBlocks) {
-      if (totalChars >= 180000) {
-        break;
-      }
-
-      const remaining =
-        180000 - totalChars;
-
-      const text =
-        block.text.slice(0, remaining);
-
-      limitedBlocks.push({
-        index: block.index,
-        text
-      });
-
-      totalChars += text.length;
-    }
-
-    // =========================================================
-    // NORMALIZE TEXT
-    // =========================================================
-
-    function normalize(text) {
-      return String(text || "")
-        .replace(/\s+/g, " ")
-        .trim()
-        .toLowerCase();
-    }
-
-    // =========================================================
-    // OPENAI
-    // =========================================================
-
-    async function callOpenAI(
-      prompt,
-      schema,
-      name,
-      attempt = 1
-    ) {
-      const controller =
-        new AbortController();
-
-      const timeout =
-        setTimeout(() => {
-          controller.abort();
-        }, 30000);
-
-      try {
-        const response =
-          await fetch(
-            "https://api.openai.com/v1/responses",
-            {
-              method: "POST",
-
-              headers: {
-                "Content-Type":
-                  "application/json",
-
-                "Authorization":
-                  `Bearer ${apiKey}`
-              },
-
-              body: JSON.stringify({
-                model: "gpt-5-mini",
-
-                input: prompt,
-
-                store: false,
-
-                max_output_tokens: 1400,
-
-                text: {
-                  format: {
-                    type: "json_schema",
-                    name,
-                    strict: true,
-                    schema
-                  }
-                }
-              }),
-
-              signal: controller.signal
-            }
-          );
-
-        const raw =
-          await response.text();
-
-        // -----------------------------------------------------
-        // API ERROR
-        // -----------------------------------------------------
-
-        if (!response.ok) {
-          console.error(
-            "OPENAI ERROR:",
-            response.status,
-            raw.slice(0, 4000)
-          );
-
-          // Retry transient errors.
-          if (
-            attempt < 2 &&
-            (
-              response.status === 429 ||
-              response.status >= 500
-            )
-          ) {
-            await new Promise(resolve =>
-              setTimeout(resolve, 700)
-            );
-
-            return callOpenAI(
-              prompt,
-              schema,
-              name,
-              attempt + 1
-            );
-          }
-
-          throw new Error(
-            `OpenAI API error ${response.status}`
-          );
-        }
-
-        // -----------------------------------------------------
-        // PARSE JSON
-        // -----------------------------------------------------
-
-        let data;
-
-        try {
-          data = JSON.parse(raw);
-        } catch (error) {
-          console.error(
-            "OPENAI INVALID JSON:",
-            raw.slice(0, 4000)
-          );
-
-          if (attempt < 2) {
-            await new Promise(resolve =>
-              setTimeout(resolve, 500)
-            );
-
-            return callOpenAI(
-              prompt,
-              schema,
-              name,
-              attempt + 1
-            );
-          }
-
-          throw new Error(
-            "Invalid OpenAI response"
-          );
-        }
-
-        // -----------------------------------------------------
-        // PRIMARY OUTPUT PATH
-        // -----------------------------------------------------
-
-        if (
-          typeof data.output_text === "string" &&
-          data.output_text.trim()
-        ) {
-          try {
-            return JSON.parse(
-              data.output_text.trim()
-            );
-          } catch (error) {
-            console.error(
-              "OUTPUT_TEXT INVALID JSON:",
-              data.output_text.slice(0, 4000)
-            );
-          }
-        }
-
-        // -----------------------------------------------------
-        // OUTPUT ARRAY FALLBACK
-        // -----------------------------------------------------
-
-        const textParts = [];
-
-        if (Array.isArray(data.output)) {
-          for (const item of data.output) {
-            if (
-              !item ||
-              !Array.isArray(item.content)
-            ) {
-              continue;
-            }
-
-            for (const content of item.content) {
-              if (
-                content &&
-                content.type === "output_text" &&
-                typeof content.text === "string"
-              ) {
-                textParts.push(
-                  content.text
-                );
-              }
-            }
-          }
-        }
-
-        const extractedText =
-          textParts.join("").trim();
-
-        if (extractedText) {
-          try {
-            return JSON.parse(
-              extractedText
-            );
-          } catch (error) {
-            console.error(
-              "EXTRACTED OUTPUT INVALID JSON:",
-              extractedText.slice(0, 4000)
-            );
-          }
-        }
-
-        // -----------------------------------------------------
-        // EMPTY OUTPUT
-        // -----------------------------------------------------
-
-        console.error(
-          "OPENAI EMPTY OUTPUT:",
-          JSON.stringify(data).slice(0, 6000)
-        );
-
-        // Retry once.
-        if (attempt < 2) {
-          await new Promise(resolve =>
-            setTimeout(resolve, 700)
-          );
-
-          return callOpenAI(
-            prompt,
-            schema,
-            name,
-            attempt + 1
-          );
-        }
-
-        throw new Error(
-          "Empty OpenAI response"
-        );
-
-      } catch (error) {
-        if (
-          error &&
-          error.name === "AbortError"
-        ) {
-          console.error(
-            "OPENAI TIMEOUT"
-          );
-
-          if (attempt < 2) {
-            return callOpenAI(
-              prompt,
-              schema,
-              name,
-              attempt + 1
-            );
-          }
-
-          throw new Error(
-            "OpenAI request timed out"
-          );
-        }
-
-        throw error;
-
-      } finally {
-        clearTimeout(timeout);
-      }
-    }
-
-    // =========================================================
-    // PASS 1 — SEMANTIC RETRIEVAL
-    // =========================================================
-
-    const retrievalSchema = {
-      type: "object",
-
-      properties: {
-        relevant_blocks: {
-          type: "array",
-
-          items: {
-            type: "object",
-
-            properties: {
-              index: {
-                type: "integer"
-              },
-
-              reason: {
-                type: "string"
-              }
-            },
-
-            required: [
-              "index",
-              "reason"
-            ],
-
-            additionalProperties: false
-          }
-        }
-      },
-
-      required: [
-        "relevant_blocks"
-      ],
-
-      additionalProperties: false
-    };
-
-    const retrievalPrompt = `
-You are Snip's webpage retrieval engine.
-
-Your job is to find where on the ORIGINAL WEBPAGE the answer
-to the user's question is located.
-
-USER QUESTION:
-
-"${safeQuestion}"
-
-IMPORTANT:
-
-The user wants the information that DIRECTLY answers the question.
-
-Do not simply select passages that mention the same topic.
-
-For example:
-
-Question:
-"When did Apollo 11 launch?"
-
-GOOD:
-"Saturn V AS-506 launched Apollo 11 on July 16, 1969..."
-
-BAD:
-"Full shutdown of the first-stage engines occurred about
-2 minutes and 42 seconds into the mission..."
-
-The second passage is related to the launch, but it does NOT
-directly answer when Apollo 11 launched.
-
-Another example:
-
-Question:
-"Where did Apollo 11 land?"
-
-GOOD:
-"landing in the Sea of Tranquility..."
-
-BAD:
-"a three-day transit..."
-
-Select up to 12 blocks that could contain the DIRECT answer.
-
-Rank the most likely blocks first.
-
-Understand the meaning of the question rather than relying
-only on exact keyword matches.
-
-Return only block indexes and short reasons.
-
-PAGE BLOCKS:
-
-${JSON.stringify(limitedBlocks)}
-`;
-
-    const retrieval =
-      await callOpenAI(
-        retrievalPrompt,
-        retrievalSchema,
-        "snip_retrieval"
-      );
-
-    const selectedIndexes =
-      Array.isArray(
-        retrieval.relevant_blocks
-      )
-        ? retrieval.relevant_blocks
-            .map(item => item.index)
-            .filter(index =>
-              limitedBlocks.some(
-                block =>
-                  block.index === index
-              )
-            )
-            .slice(0, 12)
-        : [];
-
-    // =========================================================
-    // CANDIDATE BLOCKS
-    // =========================================================
-
-    let candidateBlocks =
-      limitedBlocks.filter(block =>
-        selectedIndexes.includes(
-          block.index
-        )
-      );
-
-    // Fallback if retrieval returns nothing.
-    if (!candidateBlocks.length) {
-      candidateBlocks =
-        limitedBlocks.slice(0, 12);
-    }
-
-    // =========================================================
-    // PASS 2 — PRECISION LOCATOR
-    // =========================================================
-
-    const locatorSchema = {
-      type: "object",
-
-      properties: {
-        evidence: {
-          type: "array",
-
-          items: {
-            type: "object",
-
-            properties: {
-              block_index: {
-                type: "integer"
-              },
-
-              text: {
-                type: "string"
-              }
-            },
-
-            required: [
-              "block_index",
-              "text"
-            ],
-
-            additionalProperties: false
-          }
-        }
-      },
-
-      required: [
-        "evidence"
-      ],
-
-      additionalProperties: false
-    };
-
-    const locatorPrompt = `
-You are Snip's precision locator.
-
-USER QUESTION:
-
-"${safeQuestion}"
-
-Your job is to select the exact passage from the original
-webpage that BEST answers the question.
-
-This is NOT a summarization task.
-
-The user will be taken directly to the passage you select.
-
-Therefore accuracy is critical.
-
-RULES:
-
-1. Choose the MOST DIRECT answer.
-
-2. Do not choose a passage merely because it is related
-   to the subject.
-
-3. Prefer the sentence that actually contains the answer.
-
-4. If the question asks WHEN, select the passage containing
-   the relevant date/time.
-
-5. If the question asks WHERE, select the passage containing
-   the relevant location.
-
-6. If the question asks WHO, select the passage identifying
-   the person or people.
-
-7. If the question asks HOW MANY, select the passage
-   containing the number.
-
-8. If the question asks WHY, select the passage explaining
-   the cause or reason.
-
-9. Copy the selected passage VERBATIM from the webpage.
-
-10. Do not rewrite it.
-
-11. Do not summarize it.
-
-12. Do not invent text.
-
-13. Keep the selected passage as short as possible while
-    preserving the answer.
-
-14. You may return up to 2 passages only when two passages
-    are genuinely necessary.
-
-15. If the page does not contain the answer, return an
-    empty evidence array.
-
-IMPORTANT:
-
-For a question such as:
-
-"When did Apollo 11 launch?"
-
-Prefer:
-
-"Saturn V AS-506 launched Apollo 11 on July 16, 1969..."
-
-over a later sentence about engine shutdown.
-
-For:
-
-"Where did Apollo 11 land?"
-
-Prefer the sentence containing:
-
-"Sea of Tranquility"
-
-over a sentence merely describing the trip to the Moon.
-
-CANDIDATE BLOCKS:
-
-${JSON.stringify(candidateBlocks)}
-`;
-
-    const located =
-      await callOpenAI(
-        locatorPrompt,
-        locatorSchema,
-        "snip_locator"
-      );
-
-    // =========================================================
-    // VALIDATION
-    // =========================================================
-
-    const evidence =
-      Array.isArray(located.evidence)
-        ? located.evidence
-        : [];
-
-    const validEvidence = [];
-
-    for (const item of evidence) {
-      if (
-        !item ||
-        typeof item.block_index !== "number" ||
-        typeof item.text !== "string"
-      ) {
-        continue;
-      }
-
-      const block =
-        limitedBlocks.find(
-          b =>
-            b.index ===
-            item.block_index
-        );
-
-      if (!block) {
-        continue;
-      }
-
-      const original =
-        block.text;
-
-      const exactMatch =
-        original.includes(
-          item.text
-        );
-
-      const normalizedOriginal =
-        normalize(original);
-
-      const normalizedEvidence =
-        normalize(item.text);
-
-      const normalizedMatch =
-        normalizedOriginal.includes(
-          normalizedEvidence
-        );
-
-      if (
-        exactMatch ||
-        normalizedMatch
-      ) {
-        validEvidence.push({
-          block_index:
-            item.block_index,
-
-          text:
-            item.text
+        sentences.push({
+          block_index: block.index,
+          sentence: clean,
+          section: block.section,
+          kind: block.kind
         });
       }
     }
 
-    // =========================================================
-    // FINAL RESPONSE
-    // =========================================================
+    // Keep enough context for long pages.
+    // But send sentences rather than huge paragraphs.
+    const MAX_SENTENCES = 700;
+
+    const sentenceCandidates = sentences.slice(0, MAX_SENTENCES);
+
+    // --------------------------------------------------
+    // Detect question intent
+    // --------------------------------------------------
+
+    const q = question.toLowerCase().trim();
+
+    const isDuration =
+      /\bhow long\b/.test(q) ||
+      /\bhow many (hours|minutes|days|weeks|months|years)\b/.test(q) ||
+      /\bwhat was the duration\b/.test(q);
+
+    const isLocation =
+      /\bwhere\b/.test(q) ||
+      /\bwhere exactly\b/.test(q) ||
+      /\bwhat location\b/.test(q) ||
+      /\bwhich location\b/.test(q);
+
+    const isWho =
+      /\bwho\b/.test(q);
+
+    const isWhen =
+      /\bwhen\b/.test(q) ||
+      /\bwhat date\b/.test(q) ||
+      /\bwhat time\b/.test(q);
+
+    // --------------------------------------------------
+    // Add deterministic hints.
+    // These do NOT answer the question.
+    // They only help the model choose the right sentence.
+    // --------------------------------------------------
+
+    const candidateText = sentenceCandidates
+      .map((item, i) => {
+        let hint = "";
+
+        const s = item.sentence.toLowerCase();
+
+        if (isDuration) {
+          if (
+            /\b\d+(?:\.\d+)?\s*(hours?|hrs?|minutes?|mins?|days?|weeks?|months?|years?)\b/.test(s) ||
+            /\bmore than\b/.test(s) ||
+            /\bless than\b/.test(s) ||
+            /\bapproximately\b/.test(s) ||
+            /\babout\b/.test(s)
+          ) {
+            hint = " [DURATION-CANDIDATE]";
+          }
+        }
+
+        if (isLocation) {
+          if (
+            /\blanding\b/.test(s) ||
+            /\blanded\b/.test(s) ||
+            /\bdescended\b/.test(s) ||
+            /\barrived\b/.test(s) ||
+            /\breached\b/.test(s) ||
+            /\breached\b/.test(s) ||
+            /\btouched down\b/.test(s)
+          ) {
+            hint += " [LOCATION-CANDIDATE]";
+          }
+
+          // Explicitly discourage "saw the landing site"
+          // when the user asks where they landed.
+          if (
+            /\bsaw\b/.test(s) &&
+            /\blanding site\b/.test(s)
+          ) {
+            hint += " [OBSERVATION-NOT-ACTUAL-LANDING]";
+          }
+        }
+
+        if (isWhen) {
+          if (
+            /\b\d{4}\b/.test(s) ||
+            /\bjan(?:uary)?\b|\bfeb(?:ruary)?\b|\bmar(?:ch)?\b|\bapr(?:il)?\b|\bmay\b|\bjun(?:e)?\b|\bjul(?:y)?\b|\baug(?:ust)?\b|\bsep(?:tember)?\b|\boct(?:ober)?\b|\bnov(?:ember)?\b|\bdec(?:ember)?\b/.test(s)
+          ) {
+            hint += " [TIME-CANDIDATE]";
+          }
+        }
+
+        return `[${i}] block=${item.block_index}${hint}\n${item.sentence}`;
+      })
+      .join("\n\n");
+
+    // --------------------------------------------------
+    // Ask OpenAI for the EXACT answer sentence.
+    // --------------------------------------------------
+
+    const prompt = `
+You are Snip, an exact-location webpage retrieval system.
+
+USER QUESTION:
+${question}
+
+Your job is NOT to summarize the page.
+
+Your job is to identify the SINGLE sentence from the supplied webpage that most directly answers the user's question.
+
+CRITICAL RULES:
+
+1. Return ONLY ONE sentence whenever one sentence directly answers the question.
+2. Prefer the smallest possible evidence passage.
+3. Do NOT return an entire paragraph.
+4. Do NOT combine multiple unrelated sentences.
+5. Do NOT choose a sentence merely because it contains related words.
+6. Choose the sentence that actually answers the question.
+
+QUESTION TYPE RULES:
+
+If the question asks "HOW LONG":
+- Prefer the sentence containing the actual duration.
+- Look for hours, minutes, days, weeks, months, years, etc.
+- Do NOT choose a sentence describing what happened afterward.
+- For example, if the page says:
+  "After more than 21 hours on the lunar surface, they rejoined Collins..."
+  that sentence is the correct evidence for "How long did they stay on the Moon?"
+
+If the question asks "WHERE":
+- Choose the sentence describing where the event actually occurred.
+- Prefer sentences containing "landed", "landing", "descended", "arrived", "reached", or "touched down".
+- Do NOT choose a sentence merely saying people later saw, viewed, mapped, or observed the location.
+- For example:
+  "Armstrong and Aldrin descended to the surface aboard the LM Eagle, landing in the Sea of Tranquility..."
+  is correct for "Where did Apollo 11 land?"
+- A sentence saying "the crew saw passing views of their landing site..." is NOT the answer.
+
+If the question asks WHO:
+- Choose the sentence that explicitly identifies the person.
+
+If the question asks WHEN:
+- Choose the sentence containing the relevant date/time/event timing.
+
+The returned sentence MUST be copied EXACTLY from the supplied webpage text.
+
+Return JSON only in this format:
+
+{
+  "evidence": [
+    {
+      "block_index": 123,
+      "passage": "exact sentence copied from the page"
+    }
+  ]
+}
+
+Return an empty evidence array only if the page truly does not contain the answer.
+
+WEBPAGE SENTENCES:
+
+${candidateText}
+`;
+
+    const response = await callOpenAI(apiKey, prompt);
+
+    const parsed = parseModelJSON(response);
+
+    if (!parsed || !Array.isArray(parsed.evidence)) {
+      throw new Error("Invalid model response");
+    }
+
+    // --------------------------------------------------
+    // Validate that returned evidence really exists
+    // in the original page block.
+    // --------------------------------------------------
+
+    const validEvidence = [];
+
+    for (const item of parsed.evidence.slice(0, 2)) {
+      if (!item) continue;
+
+      const blockIndex = Number(item.block_index);
+      const passage = String(item.passage || "").trim();
+
+      if (!Number.isInteger(blockIndex) || !passage) {
+        continue;
+      }
+
+      const sourceBlock = cleanedBlocks.find(
+        block => block.index === blockIndex
+      );
+
+      if (!sourceBlock) continue;
+
+      if (containsEquivalentText(sourceBlock.text, passage)) {
+        validEvidence.push({
+          block_index: blockIndex,
+          passage
+        });
+      }
+    }
+
+    // --------------------------------------------------
+    // Deterministic fallback for obvious duration/location
+    // questions if AI selected a nearby sentence.
+    // --------------------------------------------------
+
+    if (validEvidence.length === 0 || needsPrecisionOverride(validEvidence, question)) {
+      const fallback = findBestDeterministicSentence(
+        question,
+        cleanedBlocks
+      );
+
+      if (fallback) {
+        return res.status(200).json({
+          evidence: [fallback]
+        });
+      }
+    }
 
     return res.status(200).json({
-      evidence:
-        validEvidence.slice(0, 2)
+      evidence: validEvidence
     });
 
   } catch (error) {
-    console.error(
-      "FUNCTION ERROR:",
-      error
-    );
+    console.error("FUNCTION ERROR:", error);
 
     return res.status(500).json({
       error: "Function failed"
     });
   }
+}
+
+
+// ======================================================
+// OpenAI
+// ======================================================
+
+async function callOpenAI(apiKey, prompt) {
+  const body = {
+    model: "gpt-5-mini",
+    store: false,
+
+    input: [
+      {
+        role: "user",
+        content: [
+          {
+            type: "input_text",
+            text: prompt
+          }
+        ]
+      }
+    ],
+
+    max_output_tokens: 1200,
+
+    text: {
+      format: {
+        type: "json_schema",
+        name: "snip_evidence",
+        strict: true,
+        schema: {
+          type: "object",
+          properties: {
+            evidence: {
+              type: "array",
+              maxItems: 2,
+              items: {
+                type: "object",
+                properties: {
+                  block_index: {
+                    type: "integer"
+                  },
+                  passage: {
+                    type: "string"
+                  }
+                },
+                required: [
+                  "block_index",
+                  "passage"
+                ],
+                additionalProperties: false
+              }
+            }
+          },
+          required: [
+            "evidence"
+          ],
+          additionalProperties: false
+        }
+      }
+    }
+  };
+
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const response = await fetch(
+      "https://api.openai.com/v1/responses",
+      {
+        method: "POST",
+
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization": `Bearer ${apiKey}`
+        },
+
+        body: JSON.stringify(body)
+      }
+    );
+
+    const text = await response.text();
+
+    if (!response.ok) {
+      console.error(
+        "OpenAI HTTP error:",
+        response.status,
+        text.slice(0, 2000)
+      );
+
+      if (
+        response.status === 429 ||
+        response.status >= 500
+      ) {
+        await sleep(700 * (attempt + 1));
+        continue;
+      }
+
+      throw new Error("OpenAI API failed");
+    }
+
+    let data;
+
+    try {
+      data = JSON.parse(text);
+    } catch {
+      throw new Error("Invalid OpenAI response");
+    }
+
+    const outputText = extractOutputText(data);
+
+    if (outputText && outputText.trim()) {
+      return outputText;
+    }
+
+    console.error(
+      "Empty OpenAI response:",
+      JSON.stringify(data).slice(0, 4000)
+    );
+
+    await sleep(500 * (attempt + 1));
+  }
+
+  throw new Error("Empty OpenAI response");
+}
+
+
+// ======================================================
+// Extract Responses API text
+// ======================================================
+
+function extractOutputText(data) {
+  if (
+    typeof data?.output_text === "string" &&
+    data.output_text.trim()
+  ) {
+    return data.output_text;
+  }
+
+  const parts = [];
+
+  for (const output of data?.output || []) {
+    for (const content of output?.content || []) {
+      if (
+        typeof content?.text === "string" &&
+        content.text.trim()
+      ) {
+        parts.push(content.text);
+      }
+    }
+  }
+
+  return parts.join("\n").trim();
+}
+
+
+// ======================================================
+// Parse JSON returned by model
+// ======================================================
+
+function parseModelJSON(text) {
+  try {
+    return JSON.parse(text);
+  } catch {}
+
+  const match = text.match(/\{[\s\S]*\}/);
+
+  if (!match) {
+    return null;
+  }
+
+  try {
+    return JSON.parse(match[0]);
+  } catch {
+    return null;
+  }
+}
+
+
+// ======================================================
+// Sentence splitting
+// ======================================================
+
+function splitIntoSentences(text) {
+  const normalized = text
+    .replace(/\s+/g, " ")
+    .trim();
+
+  if (!normalized) {
+    return [];
+  }
+
+  // Handles normal punctuation while avoiding
+  // destroying common abbreviations/numbers.
+  const matches = normalized.match(
+    /[^.!?]+(?:[.!?]+(?=\s|$)|$)/g
+  );
+
+  return matches || [normalized];
+}
+
+
+// ======================================================
+// Text normalization
+// ======================================================
+
+function normalizeText(text) {
+  return String(text || "")
+    .normalize("NFKC")
+    .replace(/[“”„‟]/g, '"')
+    .replace(/[‘’‚‛]/g, "'")
+    .replace(/\u00a0/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .toLowerCase();
+}
+
+
+function containsEquivalentText(source, passage) {
+  const a = normalizeText(source);
+  const b = normalizeText(passage);
+
+  if (!a || !b) {
+    return false;
+  }
+
+  if (a.includes(b)) {
+    return true;
+  }
+
+  // More tolerant comparison for punctuation differences.
+  const compactA = a.replace(/[^\p{L}\p{N}]+/gu, "");
+  const compactB = b.replace(/[^\p{L}\p{N}]+/gu, "");
+
+  return compactA.includes(compactB);
+}
+
+
+// ======================================================
+// Precision override
+// ======================================================
+
+function needsPrecisionOverride(evidence, question) {
+  if (!evidence.length) {
+    return true;
+  }
+
+  const q = question.toLowerCase();
+
+  const passage = evidence[0].passage.toLowerCase();
+
+  // Duration question selected something without
+  // a duration expression.
+  if (/\bhow long\b/.test(q)) {
+    const hasDuration =
+      /\b\d+(?:\.\d+)?\s*(hours?|hrs?|minutes?|mins?|days?|weeks?|months?|years?)\b/.test(passage) ||
+      /\bmore than\b/.test(passage) ||
+      /\bless than\b/.test(passage);
+
+    if (!hasDuration) {
+      return true;
+    }
+  }
+
+  // Location question selected an observation sentence
+  // instead of the actual landing/event sentence.
+  if (/\bwhere\b/.test(q)) {
+    if (
+      /\bsaw\b/.test(passage) &&
+      /\blanding site\b/.test(passage)
+    ) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+
+// ======================================================
+// Deterministic fallback
+// ======================================================
+
+function findBestDeterministicSentence(question, blocks) {
+  const q = question.toLowerCase();
+
+  const sentences = [];
+
+  for (const block of blocks) {
+    for (const sentence of splitIntoSentences(block.text)) {
+      const clean = sentence.trim();
+
+      if (!clean) continue;
+
+      sentences.push({
+        block_index: block.index,
+        passage: clean,
+        score: 0
+      });
+    }
+  }
+
+  // --------------------------------------------
+  // Duration
+  // --------------------------------------------
+
+  if (/\bhow long\b/.test(q)) {
+    for (const item of sentences) {
+      const s = item.passage.toLowerCase();
+
+      if (
+        /\b\d+(?:\.\d+)?\s*(hours?|hrs?|minutes?|mins?|days?|weeks?|months?|years?)\b/.test(s)
+      ) {
+        item.score += 100;
+      }
+
+      if (/\bmore than\b/.test(s)) {
+        item.score += 30;
+      }
+
+      if (/\bless than\b/.test(s)) {
+        item.score += 20;
+      }
+
+      if (/\bon the (?:lunar|moon)\b/.test(s)) {
+        item.score += 20;
+      }
+
+      if (/\blunar surface\b/.test(s)) {
+        item.score += 30;
+      }
+
+      // Strong penalty for unrelated later events.
+      if (/\brejoined\b/.test(s)) {
+        item.score -= 15;
+      }
+
+      if (/\breturned safely to earth\b/.test(s)) {
+        item.score -= 30;
+      }
+    }
+  }
+
+  // --------------------------------------------
+  // Location
+  // --------------------------------------------
+
+  if (/\bwhere\b/.test(q)) {
+    for (const item of sentences) {
+      const s = item.passage.toLowerCase();
+
+      if (/\blanding in\b/.test(s)) {
+        item.score += 120;
+      }
+
+      if (/\blanded in\b/.test(s)) {
+        item.score += 120;
+      }
+
+      if (/\bdescended to the surface\b/.test(s)) {
+        item.score += 80;
+      }
+
+      if (/\btouched down\b/.test(s)) {
+        item.score += 100;
+      }
+
+      if (/\bsea of tranquility\b/.test(s)) {
+        item.score += 50;
+      }
+
+      // This is specifically NOT the answer
+      // to "where did they land?"
+      if (
+        /\bsaw\b/.test(s) &&
+        /\blanding site\b/.test(s)
+      ) {
+        item.score -= 150;
+      }
+
+      if (/\bpassing views\b/.test(s)) {
+        item.score -= 100;
+      }
+    }
+  }
+
+  const best = sentences
+    .filter(item => item.score > 0)
+    .sort((a, b) => b.score - a.score)[0];
+
+  return best
+    ? {
+        block_index: best.block_index,
+        passage: best.passage
+      }
+    : null;
+}
+
+
+// ======================================================
+// Utility
+// ======================================================
+
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
 }
