@@ -1,8 +1,10 @@
 export default async function handler(req, res) {
+  // -----------------------------
+  // CORS
+  // -----------------------------
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type");
-  res.setHeader("Cache-Control", "no-store");
 
   if (req.method === "OPTIONS") {
     return res.status(204).end();
@@ -15,12 +17,22 @@ export default async function handler(req, res) {
   }
 
   try {
-    if (!process.env.OPENAI_API_KEY) {
+    // -----------------------------
+    // ENV
+    // -----------------------------
+    const apiKey = process.env.OPENAI_API_KEY;
+
+    if (!apiKey) {
+      console.error("Missing OPENAI_API_KEY");
+
       return res.status(500).json({
-        error: "OPENAI_API_KEY is missing"
+        error: "Server configuration error"
       });
     }
 
+    // -----------------------------
+    // BODY
+    // -----------------------------
     const body = req.body || {};
 
     const question =
@@ -28,527 +40,492 @@ export default async function handler(req, res) {
         ? body.question.trim()
         : "";
 
-    const blocks =
-      Array.isArray(body.blocks)
-        ? body.blocks
-        : null;
+    const blocks = Array.isArray(body.blocks)
+      ? body.blocks
+      : [];
 
-    if (!question || !blocks) {
+    if (!question) {
       return res.status(400).json({
-        error: "question and blocks are required"
-      });
-    }
-
-    if (question.length > 1000) {
-      return res.status(400).json({
-        error: "Question is too long"
+        error: "Question is required"
       });
     }
 
     if (!blocks.length) {
       return res.status(400).json({
-        error: "No readable page content was found"
+        error: "No page content was provided"
       });
     }
 
-    if (blocks.length > 3000) {
+    // -----------------------------
+    // LIMIT INPUT
+    // -----------------------------
+    const safeQuestion = question.slice(0, 1000);
+
+    const safeBlocks = blocks
+      .slice(0, 500)
+      .map((block, index) => {
+        if (typeof block === "string") {
+          return {
+            index,
+            text: block.slice(0, 4000)
+          };
+        }
+
+        return {
+          index:
+            typeof block.index === "number"
+              ? block.index
+              : index,
+
+          text:
+            typeof block.text === "string"
+              ? block.text.slice(0, 4000)
+              : ""
+        };
+      })
+      .filter(block => block.text.trim());
+
+    if (!safeBlocks.length) {
       return res.status(400).json({
-        error: "This page is too large for Snip"
+        error: "No usable page content was provided"
       });
     }
 
-    /*
-     * ---------------------------------------------------------
-     * CLEAN PAGE
-     * ---------------------------------------------------------
-     */
-
-    const safeBlocks = [];
+    // Keep total request size reasonable
     let totalChars = 0;
+    const limitedBlocks = [];
 
-    for (const block of blocks) {
-      if (
-        !block ||
-        typeof block.id !== "string" ||
-        typeof block.text !== "string"
-      ) {
-        continue;
-      }
+    for (const block of safeBlocks) {
+      if (totalChars >= 180000) break;
 
-      const id = block.id.slice(0, 80);
-      const text = block.text.trim().slice(0, 1800);
+      const remaining = 180000 - totalChars;
 
-      if (!id || text.length < 10) {
-        continue;
-      }
+      const text = block.text.slice(0, remaining);
 
-      if (totalChars + text.length > 240000) {
-        break;
-      }
-
-      safeBlocks.push({
-        id,
+      limitedBlocks.push({
+        index: block.index,
         text
       });
 
       totalChars += text.length;
     }
 
-    if (!safeBlocks.length) {
-      return res.status(400).json({
-        error: "No readable page content was found"
-      });
-    }
-
-    /*
-     * ---------------------------------------------------------
-     * HELPER: CALL OPENAI
-     * ---------------------------------------------------------
-     */
-
+    // -----------------------------
+    // OPENAI CALL
+    // -----------------------------
     async function callOpenAI(prompt, schema, name) {
-      const response = await fetch(
-        "https://api.openai.com/v1/responses",
-        {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            "Authorization":
-              `Bearer ${process.env.OPENAI_API_KEY}`
-          },
-          body: JSON.stringify({
-            model: "gpt-5-mini",
-            input: prompt,
-            store: false,
-            max_output_tokens: 1200,
-            text: {
-              format: {
-                type: "json_schema",
-                name,
-                strict: true,
-                schema
-              }
-            }
-          })
-        }
-      );
+      const controller = new AbortController();
 
-      const raw = await response.text();
-
-      if (!response.ok) {
-        console.error(
-          "OpenAI request failed:",
-          raw.slice(0, 2000)
-        );
-
-        throw new Error("OpenAI request failed");
-      }
-
-      let data;
+      const timeout = setTimeout(() => {
+        controller.abort();
+      }, 30000);
 
       try {
-        data = JSON.parse(raw);
-      } catch {
-        throw new Error("Invalid OpenAI response");
-      }
+        const response = await fetch(
+          "https://api.openai.com/v1/responses",
+          {
+            method: "POST",
 
-      if (
-        typeof data?.output_text === "string" &&
-        data.output_text.trim()
-      ) {
-        return JSON.parse(
-          data.output_text.trim()
+            headers: {
+              "Content-Type": "application/json",
+              "Authorization": `Bearer ${apiKey}`
+            },
+
+            body: JSON.stringify({
+              model: "gpt-5-mini",
+
+              input: prompt,
+
+              store: false,
+
+              max_output_tokens: 1200,
+
+              text: {
+                format: {
+                  type: "json_schema",
+                  name,
+                  strict: true,
+                  schema
+                }
+              }
+            }),
+
+            signal: controller.signal
+          }
         );
-      }
 
-      const parts = [];
+        const raw = await response.text();
 
-      for (
-        const item of Array.isArray(data?.output)
-          ? data.output
-          : []
-      ) {
-        for (
-          const content of Array.isArray(item?.content)
-            ? item.content
-            : []
+        // -----------------------------
+        // OPENAI ERROR
+        // -----------------------------
+        if (!response.ok) {
+          console.error(
+            "OPENAI ERROR:",
+            response.status,
+            raw.slice(0, 4000)
+          );
+
+          throw new Error(
+            `OpenAI API error ${response.status}`
+          );
+        }
+
+        // -----------------------------
+        // PARSE RESPONSE
+        // -----------------------------
+        let data;
+
+        try {
+          data = JSON.parse(raw);
+        } catch (error) {
+          console.error(
+            "OPENAI INVALID JSON:",
+            raw.slice(0, 4000)
+          );
+
+          throw new Error(
+            "Invalid OpenAI response"
+          );
+        }
+
+        // -----------------------------
+        // METHOD 1:
+        // output_text
+        // -----------------------------
+        if (
+          typeof data.output_text === "string" &&
+          data.output_text.trim()
         ) {
-          if (
-            content?.type === "output_text" &&
-            typeof content.text === "string"
-          ) {
-            parts.push(content.text);
+          return JSON.parse(
+            data.output_text.trim()
+          );
+        }
+
+        // -----------------------------
+        // METHOD 2:
+        // output -> message -> content
+        // -----------------------------
+        const textParts = [];
+
+        if (Array.isArray(data.output)) {
+          for (const item of data.output) {
+            if (!Array.isArray(item.content)) {
+              continue;
+            }
+
+            for (const content of item.content) {
+              if (
+                content &&
+                content.type === "output_text" &&
+                typeof content.text === "string"
+              ) {
+                textParts.push(content.text);
+              }
+            }
           }
         }
+
+        const extractedText =
+          textParts.join("").trim();
+
+        if (extractedText) {
+          try {
+            return JSON.parse(extractedText);
+          } catch (error) {
+            console.error(
+              "OPENAI OUTPUT WAS NOT VALID JSON:",
+              extractedText.slice(0, 4000)
+            );
+
+            throw new Error(
+              "OpenAI returned invalid structured output"
+            );
+          }
+        }
+
+        // -----------------------------
+        // NOTHING FOUND
+        // -----------------------------
+        console.error(
+          "OPENAI EMPTY OUTPUT:",
+          JSON.stringify(data).slice(0, 6000)
+        );
+
+        throw new Error(
+          "Empty OpenAI response"
+        );
+
+      } catch (error) {
+        if (error.name === "AbortError") {
+          console.error(
+            "OPENAI TIMEOUT"
+          );
+
+          throw new Error(
+            "OpenAI request timed out"
+          );
+        }
+
+        throw error;
+
+      } finally {
+        clearTimeout(timeout);
       }
-
-      const output = parts.join("\n").trim();
-
-      if (!output) {
-        throw new Error("Empty OpenAI response");
-      }
-
-      return JSON.parse(output);
     }
 
-    /*
-     * ---------------------------------------------------------
-     * PASS 1
-     *
-     * Understand the question and find the most relevant
-     * sections of the page.
-     *
-     * This stage does NOT need to return exact highlight text.
-     * It only identifies semantically relevant blocks.
-     * ---------------------------------------------------------
-     */
-
-    const pageForRetrieval = safeBlocks
-      .map(
-        (block, index) =>
-          `[BLOCK ${index}]
-ID: ${block.id}
-TEXT:
-${block.text}`
-      )
-      .join("\n\n");
+    // =========================================================
+    // PASS 1 — FIND RELEVANT BLOCKS
+    // =========================================================
 
     const retrievalSchema = {
       type: "object",
-      additionalProperties: false,
+
       properties: {
         relevant_blocks: {
           type: "array",
-          maxItems: 8,
+
           items: {
             type: "object",
-            additionalProperties: false,
+
             properties: {
-              block_id: {
-                type: "string"
+              index: {
+                type: "integer"
               },
-              relevance: {
-                type: "number",
-                minimum: 0,
-                maximum: 1
-              },
+
               reason: {
                 type: "string"
               }
             },
+
             required: [
-              "block_id",
-              "relevance",
+              "index",
               "reason"
-            ]
+            ],
+
+            additionalProperties: false
           }
         }
       },
+
       required: [
         "relevant_blocks"
-      ]
+      ],
+
+      additionalProperties: false
     };
 
     const retrievalPrompt = `
-You are the semantic retrieval engine for Snip.
+You are the retrieval engine for Snip.
 
-Snip finds where the answer to a user's question appears on a webpage.
+Snip finds the exact part of a webpage that answers a user's question.
 
-USER QUESTION:
-${question}
+The user asked:
 
-Below is the readable content of the webpage.
+"${safeQuestion}"
 
-Your job is to UNDERSTAND the user's question and the webpage semantically.
+Below are blocks extracted from the webpage.
 
-Do NOT require the exact words from the question to appear in the page.
-
-For example:
-
-Question:
-"Who were the astronauts?"
-
-A page may say:
-"The mission was crewed by Commander Neil Armstrong, Command Module Pilot Michael Collins, and Lunar Module Pilot Edwin 'Buzz' Aldrin."
-
-That block is highly relevant even though the word "astronauts" may not appear.
-
-Another example:
-
-Question:
-"What happened after they landed?"
-
-A page may say:
-"After more than 21 hours on the surface, they rejoined Collins in lunar orbit."
-
-That passage is relevant because it describes what happened after the landing.
-
-TASK:
-
-Identify up to 8 blocks that could contain the answer.
-
-Consider:
-- synonyms
-- implied meaning
-- pronouns
-- surrounding context
-- chronology
-- people and entities
-- relationships between sections
-- headings and section structure
-- what the user is actually asking for
-
-Do NOT invent information.
-
-Only return block IDs that actually appear below.
-
-PAGE:
-
-${pageForRetrieval}
-`;
-
-    const retrievalResult = await callOpenAI(
-      retrievalPrompt,
-      retrievalSchema,
-      "snip_retrieval"
-    );
-
-    const relevantBlocks =
-      Array.isArray(
-        retrievalResult?.relevant_blocks
-      )
-        ? retrievalResult.relevant_blocks
-        : [];
-
-    /*
-     * Validate retrieval results against the actual page.
-     */
-
-    const candidateBlocks = relevantBlocks
-      .filter(
-        item =>
-          item &&
-          typeof item.block_id === "string"
-      )
-      .map(item => ({
-        block_id: item.block_id,
-        relevance: Number.isFinite(
-          Number(item.relevance)
-        )
-          ? Number(item.relevance)
-          : 0
-      }))
-      .filter(item =>
-        safeBlocks.some(
-          block =>
-            block.id === item.block_id
-        )
-      )
-      .sort(
-        (a, b) =>
-          b.relevance - a.relevance
-      )
-      .slice(0, 8)
-      .map(item =>
-        safeBlocks.find(
-          block =>
-            block.id === item.block_id
-        )
-      )
-      .filter(Boolean);
-
-    if (!candidateBlocks.length) {
-      return res.status(200).json({
-        evidence: []
-      });
-    }
-
-    /*
-     * ---------------------------------------------------------
-     * PASS 2
-     *
-     * Now inspect only the semantically relevant sections.
-     *
-     * This is where we select the actual text to highlight.
-     * ---------------------------------------------------------
-     */
-
-    const candidateSource = candidateBlocks
-      .map(
-        (block, index) =>
-          `[CANDIDATE ${index}]
-BLOCK ID: ${block.id}
-TEXT:
-${block.text}`
-      )
-      .join("\n\n");
-
-    const evidenceSchema = {
-      type: "object",
-      additionalProperties: false,
-      properties: {
-        evidence: {
-          type: "array",
-          maxItems: 2,
-          items: {
-            type: "object",
-            additionalProperties: false,
-            properties: {
-              block_id: {
-                type: "string"
-              },
-              text: {
-                type: "string"
-              },
-              score: {
-                type: "number",
-                minimum: 0,
-                maximum: 1
-              }
-            },
-            required: [
-              "block_id",
-              "text",
-              "score"
-            ]
-          }
-        }
-      },
-      required: [
-        "evidence"
-      ]
-    };
-
-    const evidencePrompt = `
-You are Snip's precision source locator.
-
-The system has already identified the most semantically relevant parts of a webpage.
-
-USER QUESTION:
-${question}
-
-CANDIDATE PAGE SECTIONS:
-
-${candidateSource}
-
-Now select the smallest original passage that answers the user's question.
+Your job is to identify the blocks most likely to contain the answer.
 
 IMPORTANT:
 
-The question does NOT need to use the same words as the page.
+- Understand the meaning of the question.
+- Do NOT require the page to use the exact wording of the question.
+- Prefer blocks containing the actual answer.
+- If a heading contains useful information, it can be selected.
+- Select up to 8 relevant blocks.
+- Return only block indexes and short reasons.
 
-Use semantic understanding.
+PAGE BLOCKS:
 
-Example:
-
-Question:
-"Who were the astronauts?"
-
-Original page:
-"The mission was crewed by Commander Neil Armstrong, Command Module Pilot Michael Collins, and Lunar Module Pilot Edwin 'Buzz' Aldrin."
-
-Return the original sentence because it contains the answer.
-
-Another example:
-
-Question:
-"How did Apollo 11 return to Earth?"
-
-If the page says:
-"The crew returned safely to Earth on July 24, splashing down in the Pacific Ocean."
-
-That original sentence is useful evidence.
-
-RULES:
-
-1. Return at most 2 passages.
-2. Prefer one passage when it fully answers the question.
-3. Keep the selected passage as short as possible.
-4. block_id MUST exactly match a candidate block ID.
-5. text MUST be copied VERBATIM from that block.
-6. Never paraphrase.
-7. Never invent text.
-8. Never combine text from multiple blocks into one text field.
-9. The selected text must actually contain information needed to answer the question.
-10. If none of the candidates answer the question, return an empty evidence array.
-
-The goal is NOT to write an answer.
-
-The goal is to tell Snip exactly which original words on the page should be highlighted.
+${JSON.stringify(limitedBlocks)}
 `;
 
-    const evidenceResult = await callOpenAI(
-      evidencePrompt,
-      evidenceSchema,
-      "snip_evidence"
-    );
-
-    const candidates =
-      Array.isArray(
-        evidenceResult?.evidence
-      )
-        ? evidenceResult.evidence
-        : [];
-
-    /*
-     * ---------------------------------------------------------
-     * FINAL VALIDATION
-     *
-     * Never allow AI-generated text that doesn't actually exist
-     * in the webpage to reach the extension.
-     * ---------------------------------------------------------
-     */
-
-    const valid = candidates
-      .filter(
-        item =>
-          item &&
-          typeof item.block_id === "string" &&
-          typeof item.text === "string"
-      )
-      .map(item => ({
-        block_id: item.block_id,
-        text: item.text.trim(),
-        score: Number.isFinite(
-          Number(item.score)
-        )
-          ? Math.max(
-              0,
-              Math.min(
-                1,
-                Number(item.score)
-              )
-            )
-          : 0
-      }))
-      .filter(item => {
-        const block = safeBlocks.find(
-          b =>
-            b.id === item.block_id
-        );
-
-        if (!block || !item.text) {
-          return false;
-        }
-
-        return block.text.includes(
-          item.text
-        );
-      })
-      .sort(
-        (a, b) =>
-          b.score - a.score
-      )
-      .slice(0, 2)
-      .map(
-        ({ block_id, text }) => ({
-          block_id,
-          text
-        })
+    const retrieval =
+      await callOpenAI(
+        retrievalPrompt,
+        retrievalSchema,
+        "snip_retrieval"
       );
 
+    const selectedIndexes =
+      Array.isArray(
+        retrieval.relevant_blocks
+      )
+        ? retrieval.relevant_blocks
+            .map(item => item.index)
+            .filter(index =>
+              limitedBlocks.some(
+                block => block.index === index
+              )
+            )
+            .slice(0, 8)
+        : [];
+
+    // -----------------------------
+    // FALLBACK
+    // -----------------------------
+    let candidateBlocks =
+      limitedBlocks.filter(block =>
+        selectedIndexes.includes(block.index)
+      );
+
+    if (!candidateBlocks.length) {
+      candidateBlocks =
+        limitedBlocks.slice(0, 8);
+    }
+
+    // =========================================================
+    // PASS 2 — EXACT LOCATION
+    // =========================================================
+
+    const locatorSchema = {
+      type: "object",
+
+      properties: {
+        evidence: {
+          type: "array",
+
+          items: {
+            type: "object",
+
+            properties: {
+              block_index: {
+                type: "integer"
+              },
+
+              text: {
+                type: "string"
+              }
+            },
+
+            required: [
+              "block_index",
+              "text"
+            ],
+
+            additionalProperties: false
+          }
+        }
+      },
+
+      required: [
+        "evidence"
+      ],
+
+      additionalProperties: false
+    };
+
+    const locatorPrompt = `
+You are Snip's precision locator.
+
+User question:
+
+"${safeQuestion}"
+
+You have candidate blocks from the original webpage.
+
+Your task is to identify the smallest useful passage that answers the question.
+
+Rules:
+
+1. Choose up to 2 passages.
+2. The passage MUST come from the provided webpage blocks.
+3. Copy the passage VERBATIM.
+4. Do not rewrite it.
+5. Do not summarize it.
+6. Do not invent text.
+7. Prefer a short passage that directly answers the question.
+8. The passage can be a sentence, several sentences, or a heading plus relevant text.
+9. If the answer is represented by a heading or metadata on the page, that can be selected.
+10. Return an empty array if there is genuinely no relevant information.
+
+CANDIDATE BLOCKS:
+
+${JSON.stringify(candidateBlocks)}
+`;
+
+    const located =
+      await callOpenAI(
+        locatorPrompt,
+        locatorSchema,
+        "snip_locator"
+      );
+
+    // =========================================================
+    // VALIDATION
+    // =========================================================
+
+    const evidence =
+      Array.isArray(located.evidence)
+        ? located.evidence
+        : [];
+
+    function normalize(text) {
+      return String(text || "")
+        .replace(/\s+/g, " ")
+        .trim()
+        .toLowerCase();
+    }
+
+    const validEvidence = [];
+
+    for (const item of evidence) {
+      if (
+        !item ||
+        typeof item.block_index !== "number" ||
+        typeof item.text !== "string"
+      ) {
+        continue;
+      }
+
+      const block =
+        limitedBlocks.find(
+          b => b.index === item.block_index
+        );
+
+      if (!block) {
+        continue;
+      }
+
+      const original =
+        block.text;
+
+      const exactMatch =
+        original.includes(item.text);
+
+      const normalizedOriginal =
+        normalize(original);
+
+      const normalizedEvidence =
+        normalize(item.text);
+
+      const normalizedMatch =
+        normalizedOriginal.includes(
+          normalizedEvidence
+        );
+
+      if (
+        exactMatch ||
+        normalizedMatch
+      ) {
+        validEvidence.push({
+          block_index:
+            item.block_index,
+
+          text:
+            item.text
+        });
+      }
+    }
+
+    // =========================================================
+    // RESPONSE
+    // =========================================================
+
     return res.status(200).json({
-      evidence: valid
+      evidence: validEvidence.slice(0, 2)
     });
 
   } catch (error) {
