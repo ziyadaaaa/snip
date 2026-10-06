@@ -1,7 +1,8 @@
 export default async function handler(req, res) {
-  // -----------------------------
+  // =========================================================
   // CORS
-  // -----------------------------
+  // =========================================================
+
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type");
@@ -17,9 +18,10 @@ export default async function handler(req, res) {
   }
 
   try {
-    // -----------------------------
-    // ENV
-    // -----------------------------
+    // =========================================================
+    // API KEY
+    // =========================================================
+
     const apiKey = process.env.OPENAI_API_KEY;
 
     if (!apiKey) {
@@ -30,9 +32,10 @@ export default async function handler(req, res) {
       });
     }
 
-    // -----------------------------
-    // BODY
-    // -----------------------------
+    // =========================================================
+    // REQUEST BODY
+    // =========================================================
+
     const body = req.body || {};
 
     const question =
@@ -40,9 +43,10 @@ export default async function handler(req, res) {
         ? body.question.trim()
         : "";
 
-    const blocks = Array.isArray(body.blocks)
-      ? body.blocks
-      : [];
+    const blocks =
+      Array.isArray(body.blocks)
+        ? body.blocks
+        : [];
 
     if (!question) {
       return res.status(400).json({
@@ -56,13 +60,15 @@ export default async function handler(req, res) {
       });
     }
 
-    // -----------------------------
-    // LIMIT INPUT
-    // -----------------------------
-    const safeQuestion = question.slice(0, 1000);
+    // =========================================================
+    // CLEAN INPUT
+    // =========================================================
+
+    const safeQuestion =
+      question.slice(0, 1000);
 
     const safeBlocks = blocks
-      .slice(0, 500)
+      .slice(0, 600)
       .map((block, index) => {
         if (typeof block === "string") {
           return {
@@ -83,7 +89,9 @@ export default async function handler(req, res) {
               : ""
         };
       })
-      .filter(block => block.text.trim());
+      .filter(block =>
+        block.text.trim()
+      );
 
     if (!safeBlocks.length) {
       return res.status(400).json({
@@ -91,16 +99,20 @@ export default async function handler(req, res) {
       });
     }
 
-    // Keep total request size reasonable
+    // Keep request size manageable.
     let totalChars = 0;
     const limitedBlocks = [];
 
     for (const block of safeBlocks) {
-      if (totalChars >= 180000) break;
+      if (totalChars >= 180000) {
+        break;
+      }
 
-      const remaining = 180000 - totalChars;
+      const remaining =
+        180000 - totalChars;
 
-      const text = block.text.slice(0, remaining);
+      const text =
+        block.text.slice(0, remaining);
 
       limitedBlocks.push({
         index: block.index,
@@ -110,55 +122,80 @@ export default async function handler(req, res) {
       totalChars += text.length;
     }
 
-    // -----------------------------
-    // OPENAI CALL
-    // -----------------------------
-    async function callOpenAI(prompt, schema, name) {
-      const controller = new AbortController();
+    // =========================================================
+    // NORMALIZE TEXT
+    // =========================================================
 
-      const timeout = setTimeout(() => {
-        controller.abort();
-      }, 30000);
+    function normalize(text) {
+      return String(text || "")
+        .replace(/\s+/g, " ")
+        .trim()
+        .toLowerCase();
+    }
+
+    // =========================================================
+    // OPENAI
+    // =========================================================
+
+    async function callOpenAI(
+      prompt,
+      schema,
+      name,
+      attempt = 1
+    ) {
+      const controller =
+        new AbortController();
+
+      const timeout =
+        setTimeout(() => {
+          controller.abort();
+        }, 30000);
 
       try {
-        const response = await fetch(
-          "https://api.openai.com/v1/responses",
-          {
-            method: "POST",
+        const response =
+          await fetch(
+            "https://api.openai.com/v1/responses",
+            {
+              method: "POST",
 
-            headers: {
-              "Content-Type": "application/json",
-              "Authorization": `Bearer ${apiKey}`
-            },
+              headers: {
+                "Content-Type":
+                  "application/json",
 
-            body: JSON.stringify({
-              model: "gpt-5-mini",
+                "Authorization":
+                  `Bearer ${apiKey}`
+              },
 
-              input: prompt,
+              body: JSON.stringify({
+                model: "gpt-5-mini",
 
-              store: false,
+                input: prompt,
 
-              max_output_tokens: 1200,
+                store: false,
 
-              text: {
-                format: {
-                  type: "json_schema",
-                  name,
-                  strict: true,
-                  schema
+                max_output_tokens: 1400,
+
+                text: {
+                  format: {
+                    type: "json_schema",
+                    name,
+                    strict: true,
+                    schema
+                  }
                 }
-              }
-            }),
+              }),
 
-            signal: controller.signal
-          }
-        );
+              signal: controller.signal
+            }
+          );
 
-        const raw = await response.text();
+        const raw =
+          await response.text();
 
-        // -----------------------------
-        // OPENAI ERROR
-        // -----------------------------
+        // -----------------------------------------------------
+        // API ERROR
+        // -----------------------------------------------------
+
         if (!response.ok) {
           console.error(
             "OPENAI ERROR:",
@@ -166,14 +203,35 @@ export default async function handler(req, res) {
             raw.slice(0, 4000)
           );
 
+          // Retry transient errors.
+          if (
+            attempt < 2 &&
+            (
+              response.status === 429 ||
+              response.status >= 500
+            )
+          ) {
+            await new Promise(resolve =>
+              setTimeout(resolve, 700)
+            );
+
+            return callOpenAI(
+              prompt,
+              schema,
+              name,
+              attempt + 1
+            );
+          }
+
           throw new Error(
             `OpenAI API error ${response.status}`
           );
         }
 
-        // -----------------------------
-        // PARSE RESPONSE
-        // -----------------------------
+        // -----------------------------------------------------
+        // PARSE JSON
+        // -----------------------------------------------------
+
         let data;
 
         try {
@@ -184,33 +242,56 @@ export default async function handler(req, res) {
             raw.slice(0, 4000)
           );
 
+          if (attempt < 2) {
+            await new Promise(resolve =>
+              setTimeout(resolve, 500)
+            );
+
+            return callOpenAI(
+              prompt,
+              schema,
+              name,
+              attempt + 1
+            );
+          }
+
           throw new Error(
             "Invalid OpenAI response"
           );
         }
 
-        // -----------------------------
-        // METHOD 1:
-        // output_text
-        // -----------------------------
+        // -----------------------------------------------------
+        // PRIMARY OUTPUT PATH
+        // -----------------------------------------------------
+
         if (
           typeof data.output_text === "string" &&
           data.output_text.trim()
         ) {
-          return JSON.parse(
-            data.output_text.trim()
-          );
+          try {
+            return JSON.parse(
+              data.output_text.trim()
+            );
+          } catch (error) {
+            console.error(
+              "OUTPUT_TEXT INVALID JSON:",
+              data.output_text.slice(0, 4000)
+            );
+          }
         }
 
-        // -----------------------------
-        // METHOD 2:
-        // output -> message -> content
-        // -----------------------------
+        // -----------------------------------------------------
+        // OUTPUT ARRAY FALLBACK
+        // -----------------------------------------------------
+
         const textParts = [];
 
         if (Array.isArray(data.output)) {
           for (const item of data.output) {
-            if (!Array.isArray(item.content)) {
+            if (
+              !item ||
+              !Array.isArray(item.content)
+            ) {
               continue;
             }
 
@@ -220,7 +301,9 @@ export default async function handler(req, res) {
                 content.type === "output_text" &&
                 typeof content.text === "string"
               ) {
-                textParts.push(content.text);
+                textParts.push(
+                  content.text
+                );
               }
             }
           }
@@ -231,36 +314,61 @@ export default async function handler(req, res) {
 
         if (extractedText) {
           try {
-            return JSON.parse(extractedText);
+            return JSON.parse(
+              extractedText
+            );
           } catch (error) {
             console.error(
-              "OPENAI OUTPUT WAS NOT VALID JSON:",
+              "EXTRACTED OUTPUT INVALID JSON:",
               extractedText.slice(0, 4000)
-            );
-
-            throw new Error(
-              "OpenAI returned invalid structured output"
             );
           }
         }
 
-        // -----------------------------
-        // NOTHING FOUND
-        // -----------------------------
+        // -----------------------------------------------------
+        // EMPTY OUTPUT
+        // -----------------------------------------------------
+
         console.error(
           "OPENAI EMPTY OUTPUT:",
           JSON.stringify(data).slice(0, 6000)
         );
+
+        // Retry once.
+        if (attempt < 2) {
+          await new Promise(resolve =>
+            setTimeout(resolve, 700)
+          );
+
+          return callOpenAI(
+            prompt,
+            schema,
+            name,
+            attempt + 1
+          );
+        }
 
         throw new Error(
           "Empty OpenAI response"
         );
 
       } catch (error) {
-        if (error.name === "AbortError") {
+        if (
+          error &&
+          error.name === "AbortError"
+        ) {
           console.error(
             "OPENAI TIMEOUT"
           );
+
+          if (attempt < 2) {
+            return callOpenAI(
+              prompt,
+              schema,
+              name,
+              attempt + 1
+            );
+          }
 
           throw new Error(
             "OpenAI request timed out"
@@ -275,7 +383,7 @@ export default async function handler(req, res) {
     }
 
     // =========================================================
-    // PASS 1 — FIND RELEVANT BLOCKS
+    // PASS 1 — SEMANTIC RETRIEVAL
     // =========================================================
 
     const retrievalSchema = {
@@ -316,26 +424,55 @@ export default async function handler(req, res) {
     };
 
     const retrievalPrompt = `
-You are the retrieval engine for Snip.
+You are Snip's webpage retrieval engine.
 
-Snip finds the exact part of a webpage that answers a user's question.
+Your job is to find where on the ORIGINAL WEBPAGE the answer
+to the user's question is located.
 
-The user asked:
+USER QUESTION:
 
 "${safeQuestion}"
 
-Below are blocks extracted from the webpage.
-
-Your job is to identify the blocks most likely to contain the answer.
-
 IMPORTANT:
 
-- Understand the meaning of the question.
-- Do NOT require the page to use the exact wording of the question.
-- Prefer blocks containing the actual answer.
-- If a heading contains useful information, it can be selected.
-- Select up to 8 relevant blocks.
-- Return only block indexes and short reasons.
+The user wants the information that DIRECTLY answers the question.
+
+Do not simply select passages that mention the same topic.
+
+For example:
+
+Question:
+"When did Apollo 11 launch?"
+
+GOOD:
+"Saturn V AS-506 launched Apollo 11 on July 16, 1969..."
+
+BAD:
+"Full shutdown of the first-stage engines occurred about
+2 minutes and 42 seconds into the mission..."
+
+The second passage is related to the launch, but it does NOT
+directly answer when Apollo 11 launched.
+
+Another example:
+
+Question:
+"Where did Apollo 11 land?"
+
+GOOD:
+"landing in the Sea of Tranquility..."
+
+BAD:
+"a three-day transit..."
+
+Select up to 12 blocks that could contain the DIRECT answer.
+
+Rank the most likely blocks first.
+
+Understand the meaning of the question rather than relying
+only on exact keyword matches.
+
+Return only block indexes and short reasons.
 
 PAGE BLOCKS:
 
@@ -357,27 +494,32 @@ ${JSON.stringify(limitedBlocks)}
             .map(item => item.index)
             .filter(index =>
               limitedBlocks.some(
-                block => block.index === index
+                block =>
+                  block.index === index
               )
             )
-            .slice(0, 8)
+            .slice(0, 12)
         : [];
 
-    // -----------------------------
-    // FALLBACK
-    // -----------------------------
+    // =========================================================
+    // CANDIDATE BLOCKS
+    // =========================================================
+
     let candidateBlocks =
       limitedBlocks.filter(block =>
-        selectedIndexes.includes(block.index)
+        selectedIndexes.includes(
+          block.index
+        )
       );
 
+    // Fallback if retrieval returns nothing.
     if (!candidateBlocks.length) {
       candidateBlocks =
-        limitedBlocks.slice(0, 8);
+        limitedBlocks.slice(0, 12);
     }
 
     // =========================================================
-    // PASS 2 — EXACT LOCATION
+    // PASS 2 — PRECISION LOCATOR
     // =========================================================
 
     const locatorSchema = {
@@ -420,26 +562,81 @@ ${JSON.stringify(limitedBlocks)}
     const locatorPrompt = `
 You are Snip's precision locator.
 
-User question:
+USER QUESTION:
 
 "${safeQuestion}"
 
-You have candidate blocks from the original webpage.
+Your job is to select the exact passage from the original
+webpage that BEST answers the question.
 
-Your task is to identify the smallest useful passage that answers the question.
+This is NOT a summarization task.
 
-Rules:
+The user will be taken directly to the passage you select.
 
-1. Choose up to 2 passages.
-2. The passage MUST come from the provided webpage blocks.
-3. Copy the passage VERBATIM.
-4. Do not rewrite it.
-5. Do not summarize it.
-6. Do not invent text.
-7. Prefer a short passage that directly answers the question.
-8. The passage can be a sentence, several sentences, or a heading plus relevant text.
-9. If the answer is represented by a heading or metadata on the page, that can be selected.
-10. Return an empty array if there is genuinely no relevant information.
+Therefore accuracy is critical.
+
+RULES:
+
+1. Choose the MOST DIRECT answer.
+
+2. Do not choose a passage merely because it is related
+   to the subject.
+
+3. Prefer the sentence that actually contains the answer.
+
+4. If the question asks WHEN, select the passage containing
+   the relevant date/time.
+
+5. If the question asks WHERE, select the passage containing
+   the relevant location.
+
+6. If the question asks WHO, select the passage identifying
+   the person or people.
+
+7. If the question asks HOW MANY, select the passage
+   containing the number.
+
+8. If the question asks WHY, select the passage explaining
+   the cause or reason.
+
+9. Copy the selected passage VERBATIM from the webpage.
+
+10. Do not rewrite it.
+
+11. Do not summarize it.
+
+12. Do not invent text.
+
+13. Keep the selected passage as short as possible while
+    preserving the answer.
+
+14. You may return up to 2 passages only when two passages
+    are genuinely necessary.
+
+15. If the page does not contain the answer, return an
+    empty evidence array.
+
+IMPORTANT:
+
+For a question such as:
+
+"When did Apollo 11 launch?"
+
+Prefer:
+
+"Saturn V AS-506 launched Apollo 11 on July 16, 1969..."
+
+over a later sentence about engine shutdown.
+
+For:
+
+"Where did Apollo 11 land?"
+
+Prefer the sentence containing:
+
+"Sea of Tranquility"
+
+over a sentence merely describing the trip to the Moon.
 
 CANDIDATE BLOCKS:
 
@@ -462,13 +659,6 @@ ${JSON.stringify(candidateBlocks)}
         ? located.evidence
         : [];
 
-    function normalize(text) {
-      return String(text || "")
-        .replace(/\s+/g, " ")
-        .trim()
-        .toLowerCase();
-    }
-
     const validEvidence = [];
 
     for (const item of evidence) {
@@ -482,7 +672,9 @@ ${JSON.stringify(candidateBlocks)}
 
       const block =
         limitedBlocks.find(
-          b => b.index === item.block_index
+          b =>
+            b.index ===
+            item.block_index
         );
 
       if (!block) {
@@ -493,7 +685,9 @@ ${JSON.stringify(candidateBlocks)}
         block.text;
 
       const exactMatch =
-        original.includes(item.text);
+        original.includes(
+          item.text
+        );
 
       const normalizedOriginal =
         normalize(original);
@@ -521,11 +715,12 @@ ${JSON.stringify(candidateBlocks)}
     }
 
     // =========================================================
-    // RESPONSE
+    // FINAL RESPONSE
     // =========================================================
 
     return res.status(200).json({
-      evidence: validEvidence.slice(0, 2)
+      evidence:
+        validEvidence.slice(0, 2)
     });
 
   } catch (error) {
