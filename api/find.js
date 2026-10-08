@@ -433,6 +433,9 @@ function analyzeQuestion(question) {
     isWhich:
       /\bwhich\b/.test(q),
 
+    isRelationship:
+  /\b(?:husband|wife|father|mother|son|daughter|brother|sister|partner|spouse)\b/.test(q),
+   
     terms: extractQuestionTerms(q)
   };
 }
