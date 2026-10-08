@@ -514,10 +514,6 @@ function scoreSentence(item, info) {
       /\b(?:was|were|became|remained|stayed|served|led|commanded|piloted|flew|walked|landed|discovered|invented|married|husband|wife|brother|sister|father|mother|son|daughter|partner|spouse)\b/i
         .test(sentence);
 
-    /*
-     * Lunar orbit.
-     */
-
     if (
       /\b(?:stayed|remained)\b/i.test(sentence) &&
       /\b(?:lunar orbit|orbit)\b/i.test(sentence)
@@ -555,25 +551,11 @@ function scoreSentence(item, info) {
       score -= 80;
     }
 
-
     /*
-     * ======================================================
      * RELATIONSHIP QUESTIONS
-     *
-     * IMPORTANT:
-     *
-     * "Curie became ... and her husband joined..."
-     *
-     * must NOT be considered a valid answer to:
-     *
-     * "Who was Marie Curie's husband?"
-     *
-     * because "her husband" does not identify the husband.
-     * ======================================================
      */
 
     if (info.isRelationship) {
-
       const relationshipWord =
         /\b(?:husband|wife|spouse|father|mother|son|daughter|brother|sister|partner)\b/i
           .test(sentence);
@@ -582,17 +564,9 @@ function scoreSentence(item, info) {
         /\b(?:married|husband|wife|spouse|father|mother|son|daughter|brother|sister|partner)\b/i
           .test(sentence);
 
-      /*
-       * Explicit relationship gives some weight.
-       */
-
       if (explicitRelationship) {
         score += 60;
       }
-
-      /*
-       * Direct marriage wording is especially strong.
-       */
 
       if (
         /\b(?:married|married to|was married to|were married)\b/i
@@ -601,21 +575,12 @@ function scoreSentence(item, info) {
         score += 160;
       }
 
-      /*
-       * "X's husband/wife" directly identifies the person.
-       */
-
       if (
         /\b[A-Z][A-Za-z'-]+(?:\s+[A-Z][A-Za-z'-]+){0,3}'s\s+(?:husband|wife|spouse)\b/
           .test(sentence)
       ) {
         score += 140;
       }
-
-      /*
-       * "husband X" / "wife X" can identify the person,
-       * but only if X is actually present.
-       */
 
       if (
         /\b(?:husband|wife|spouse)\s+[A-Z][A-Za-z'-]+(?:\s+[A-Z][A-Za-z'-]+){0,2}\b/
@@ -624,21 +589,12 @@ function scoreSentence(item, info) {
         score += 100;
       }
 
-      /*
-       * "her husband" / "his wife" is NOT an answer.
-       */
-
       if (
         /\b(?:her|his|their)\s+(?:husband|wife|spouse)\b/i
           .test(sentence)
       ) {
         score -= 220;
       }
-
-      /*
-       * "with her husband..." is an especially weak
-       * incidental reference.
-       */
 
       if (
         /\bwith\s+(?:her|his|their)\s+(?:husband|wife|spouse)\b/i
@@ -647,22 +603,12 @@ function scoreSentence(item, info) {
         score -= 250;
       }
 
-      /*
-       * Parenthetical relationship mentions are usually
-       * citations/context rather than the answer.
-       */
-
       if (
         relationshipWord &&
         /[\(\[]/.test(sentence)
       ) {
         score -= 100;
       }
-
-      /*
-       * If the sentence only has a pronoun relationship
-       * and no explicit relationship identity, strongly reject.
-       */
 
       if (
         /\b(?:her|his|their)\s+(?:husband|wife|spouse)\b/i
@@ -679,23 +625,72 @@ function scoreSentence(item, info) {
    * ========================================================
    * WHEN
    * ========================================================
+   *
+   * A date alone is not enough.
+   *
+   * We strongly prefer a sentence where the date is tied
+   * to the event being asked about.
+   * ========================================================
    */
 
   if (info.isWhen) {
-    if (
+    const hasDate =
       /\b(?:19|20)\d{2}\b/.test(sentence) ||
       /\b(?:january|february|march|april|may|june|july|august|september|october|november|december)\b/i.test(sentence) ||
       /\b(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b/i.test(sentence) ||
       /\b\d{1,2}:\d{2}\b/.test(sentence) ||
-      /\b(?:utc|gmt|est|edt|pst|pdt)\b/i.test(sentence)
-    ) {
-      score += 100;
+      /\b(?:utc|gmt|est|edt|pst|pdt)\b/i.test(sentence);
+
+    if (hasDate) {
+      score += 80;
     }
 
+    /*
+     * Event/date connection.
+     */
+
     if (
-      /\b(?:launched|launch|began|started|ended|occurred|happened|landed|arrived|departed|died|born)\b/i.test(sentence)
+      /\b(?:occurred|happened|took place|began|started|ended|launched|landed|arrived|departed|born|died|married|won|received|awarded|was awarded|was born|was launched)\b/i
+        .test(sentence)
     ) {
-      score += 50;
+      score += 90;
+    }
+
+    /*
+     * Award/Nobel questions.
+     */
+
+    if (
+      /\b(?:nobel|prize|award|awarded|won|received|honou?red|honou?red with)\b/i
+        .test(sentence)
+    ) {
+      score += 70;
+    }
+
+    /*
+     * Date phrasing.
+     */
+
+    if (
+      hasDate &&
+      /\b(?:when|in|on|during|after|before)\b/i.test(sentence)
+    ) {
+      score += 20;
+    }
+
+    /*
+     * A sentence containing a date but merely discussing
+     * background/history is weaker.
+     */
+
+    if (
+      hasDate &&
+      /\b(?:researches|services|phenomena|career|history|later|earlier)\b/i
+        .test(sentence) &&
+      !/\b(?:occurred|happened|took place|began|started|ended|launched|landed|arrived|departed|born|died|married|won|received|awarded)\b/i
+        .test(sentence)
+    ) {
+      score -= 40;
     }
   }
 
@@ -779,13 +774,100 @@ function scoreSentence(item, info) {
    * ========================================================
    * WHY
    * ========================================================
+   *
+   * Stronger cause detection.
+   *
+   * The goal is to prefer:
+   *
+   * "The Depression was caused by..."
+   *
+   * over:
+   *
+   * "This caused economic stagnation..."
+   *
+   * ========================================================
    */
 
   if (info.isWhy) {
+    const hasCauseLanguage =
+      /\b(?:because|due to|since|as a result of|reason|caused by|caused|cause|causes|resulted from|resulting from|triggered|contributed to|contributing to|led to|stemmed from|arose from|driven by|in response to)\b/i
+        .test(sentence);
+
+    if (hasCauseLanguage) {
+      score += 100;
+    }
+
+    const relevantTerms =
+      info.terms.filter(
+        term => term.length >= 4
+      );
+
+    const matchingTerms =
+      relevantTerms.filter(
+        term => s.includes(term)
+      ).length;
+
+    if (matchingTerms >= 1) {
+      score += 45;
+    }
+
+    if (matchingTerms >= 2) {
+      score += 80;
+    }
+
+    if (matchingTerms >= 3) {
+      score += 120;
+    }
+
+    /*
+     * Explicit cause wording is especially strong.
+     */
+
     if (
-      /\b(?:because|due to|since|as a result|reason|caused|cause|in order to|so that)\b/i.test(sentence)
+      /\b(?:one of the main causes|major cause|primary cause|main cause|key factor|major factor|primary factor|important factor|factors included|factors were|was caused by|were caused by)\b/i
+        .test(sentence)
     ) {
       score += 100;
+    }
+
+    /*
+     * Strongly prefer sentences that explicitly connect
+     * the cause to the subject.
+     */
+
+    if (
+      /\b(?:the\s+)?(?:great depression|depression)\b/i.test(sentence) &&
+      /\b(?:caused by|cause of|causes included|caused|resulted from|stemmed from|triggered by|factors included)\b/i.test(sentence)
+    ) {
+      score += 150;
+    }
+
+    /*
+     * Downstream consequences should not beat actual causes.
+     */
+
+    if (
+      /\b(?:recovery|stagnation|decline|aftermath|consequence|resulting economy|economic recovery)\b/i
+        .test(sentence) &&
+      !/\b(?:cause|caused|because|due to|factor|triggered|resulted from|stemmed from)\b/i
+        .test(sentence)
+    ) {
+      score -= 50;
+    }
+
+    /*
+     * "X led to Y" is dangerous for WHY questions:
+     *
+     * "This policy led to economic stagnation"
+     *
+     * does not necessarily explain what caused X.
+     */
+
+    if (
+      /\b(?:led to|resulted in|caused)\b/i.test(sentence) &&
+      !/\b(?:caused by|resulted from|stemmed from|because|due to|factor|cause of)\b/i.test(sentence)
+    ) {
+      score -= 35;
     }
   }
 
@@ -887,22 +969,12 @@ function hasExplicitRelationshipIdentity(
   const text =
     String(sentence || "");
 
-  /*
-   * Direct marriage:
-   *
-   * "Marie Curie married Pierre Curie."
-   */
-
   if (
     /\b[A-Z][A-Za-z'-]+(?:\s+[A-Z][A-Za-z'-]+){0,3}\s+(?:married|was married to|were married to)\s+[A-Z][A-Za-z'-]+(?:\s+[A-Z][A-Za-z'-]+){0,3}\b/
       .test(text)
   ) {
     return true;
   }
-
-  /*
-   * "Pierre Curie was Marie Curie's husband."
-   */
 
   if (
     /\b[A-Z][A-Za-z'-]+(?:\s+[A-Z][A-Za-z'-]+){0,3}\s+(?:was|were)\s+[A-Z][A-Za-z'-]+(?:\s+[A-Za-z'-]+){0,3}'s\s+(?:husband|wife|spouse)\b/
@@ -911,20 +983,12 @@ function hasExplicitRelationshipIdentity(
     return true;
   }
 
-  /*
-   * "Marie Curie's husband Pierre Curie..."
-   */
-
   if (
     /\b[A-Z][A-Za-z'-]+(?:\s+[A-Za-z'-]+){0,3}'s\s+(?:husband|wife|spouse)\s+[A-Z][A-Za-z'-]+(?:\s+[A-Za-z'-]+){0,3}\b/
       .test(text)
   ) {
     return true;
   }
-
-  /*
-   * "husband Pierre Curie"
-   */
 
   if (
     /\b(?:husband|wife|spouse)\s+[A-Z][A-Za-z'-]+(?:\s+[A-Z][A-Za-z'-]+){0,3}\b/
@@ -933,26 +997,12 @@ function hasExplicitRelationshipIdentity(
     return true;
   }
 
-  /*
-   * Explicit parent relationships.
-   */
-
   if (
     /\b(?:father|mother|son|daughter|brother|sister|partner)\s+[A-Z][A-Za-z'-]+(?:\s+[A-Za-z'-]+){0,3}\b/
       .test(text)
   ) {
     return true;
   }
-
-  /*
-   * Critical:
-   *
-   * "her husband"
-   * "his wife"
-   * "their spouse"
-   *
-   * is NOT explicit identification.
-   */
 
   if (
     /\b(?:her|his|their)\s+(?:husband|wife|spouse)\b/i.test(text)
@@ -1016,10 +1066,6 @@ function findBestDeterministicSentence(
         item.score += 70;
       }
 
-      /*
-       * Lunar orbit.
-       */
-
       if (
         /\b(?:stayed|remained)\b/i.test(original) &&
         /\b(?:lunar orbit|orbit)\b/i.test(original)
@@ -1034,19 +1080,11 @@ function findBestDeterministicSentence(
         item.score += 100;
       }
 
-      /*
-       * First person.
-       */
-
       if (
         /\bwas the first\b|\bbecame the first\b/.test(s)
       ) {
         item.score += 100;
       }
-
-      /*
-       * Generic people.
-       */
 
       if (
         genericPeople &&
@@ -1063,22 +1101,11 @@ function findBestDeterministicSentence(
         item.score -= 100;
       }
 
-
       /*
-       * ======================================================
        * RELATIONSHIP
-       * ======================================================
        */
 
       if (info.isRelationship) {
-
-        /*
-         * The most important rule:
-         *
-         * The sentence must actually identify the person
-         * associated with the relationship.
-         */
-
         const explicitRelationship =
           hasExplicitRelationshipIdentity(
             original,
@@ -1091,20 +1118,12 @@ function findBestDeterministicSentence(
           item.score -= 150;
         }
 
-        /*
-         * Direct marriage statement.
-         */
-
         if (
           /\b(?:married|was married to|were married to)\b/i
             .test(original)
         ) {
           item.score += 220;
         }
-
-        /*
-         * Explicit "X was Y's husband".
-         */
 
         if (
           /\b(?:was|were)\b.*\b(?:husband|wife|spouse)\b/i
@@ -1113,22 +1132,12 @@ function findBestDeterministicSentence(
           item.score += 180;
         }
 
-        /*
-         * "husband Pierre Curie" type construction.
-         */
-
         if (
           /\b(?:husband|wife|spouse)\s+[A-Z][A-Za-z'-]+(?:\s+[A-Z][A-Za-z'-]+){0,3}\b/
             .test(original)
         ) {
           item.score += 150;
         }
-
-        /*
-         * ABSOLUTE PENALTY for the exact failure case:
-         *
-         * "her husband joined the faculty..."
-         */
 
         if (
           /\b(?:her|his|their)\s+(?:husband|wife|spouse)\b/i
@@ -1137,20 +1146,12 @@ function findBestDeterministicSentence(
           item.score -= 400;
         }
 
-        /*
-         * "with her husband..."
-         */
-
         if (
           /\bwith\s+(?:her|his|their)\s+(?:husband|wife|spouse)\b/i
             .test(original)
         ) {
           item.score -= 450;
         }
-
-        /*
-         * Parenthetical citation/context.
-         */
 
         if (
           /[\(\[]/.test(original) &&
@@ -1174,18 +1175,46 @@ function findBestDeterministicSentence(
       const s =
         item.sentence.toLowerCase();
 
-      if (
+      const hasDate =
         /\b(?:19|20)\d{2}\b/.test(item.sentence) ||
         /\b(?:january|february|march|april|may|june|july|august|september|october|november|december)\b/i.test(item.sentence) ||
-        /\b\d{1,2}:\d{2}\b/.test(item.sentence)
+        /\b(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b/i.test(item.sentence) ||
+        /\b\d{1,2}:\d{2}\b/.test(item.sentence);
+
+      if (hasDate) {
+        item.score += 80;
+      }
+
+      if (
+        /\b(?:launch|launched|landed|began|started|ended|occurred|happened|took place|born|died|married|won|received|awarded|was awarded)\b/i.test(s)
+      ) {
+        item.score += 90;
+      }
+
+      if (
+        /\b(?:nobel|prize|award|awarded|won|received)\b/i.test(s)
+      ) {
+        item.score += 70;
+      }
+
+      /*
+       * If the question is specifically about an award,
+       * require award-related wording to be strongly favored.
+       */
+
+      if (
+        /\b(?:nobel|prize|award)\b/i.test(info.raw) &&
+        /\b(?:nobel|prize|award|awarded|won|received)\b/i.test(s)
       ) {
         item.score += 100;
       }
 
       if (
-        /\b(?:launch|launched|landed|began|started|ended|occurred|born|died)\b/i.test(s)
+        hasDate &&
+        /\b(?:researches|services|phenomena|career|history|later|earlier)\b/i.test(s) &&
+        !/\b(?:occurred|happened|took place|began|started|ended|launched|landed|arrived|departed|born|died|married|won|received|awarded)\b/i.test(s)
       ) {
-        item.score += 60;
+        item.score -= 40;
       }
     }
   }
@@ -1266,6 +1295,88 @@ function findBestDeterministicSentence(
   }
 
 
+  /*
+   * ========================================================
+   * WHY
+   * ========================================================
+   */
+
+  if (info.isWhy) {
+    for (const item of scored) {
+      const s =
+        item.sentence.toLowerCase();
+
+      const relevantTerms =
+        info.terms.filter(
+          term => term.length >= 4
+        );
+
+      const matchingTerms =
+        relevantTerms.filter(
+          term => s.includes(term)
+        ).length;
+
+      if (matchingTerms >= 1) {
+        item.score += 45;
+      }
+
+      if (matchingTerms >= 2) {
+        item.score += 80;
+      }
+
+      if (matchingTerms >= 3) {
+        item.score += 120;
+      }
+
+      if (
+        /\b(?:because|due to|since|as a result of|caused by|caused|cause|causes|resulted from|resulting from|triggered|contributed to|contributing to|stemmed from|arose from|driven by)\b/i
+          .test(s)
+      ) {
+        item.score += 120;
+      }
+
+      if (
+        /\b(?:one of the main causes|major cause|primary cause|main cause|key factor|major factor|primary factor|important factor|factors included|factors were|was caused by|were caused by)\b/i
+          .test(s)
+      ) {
+        item.score += 120;
+      }
+
+      /*
+       * Great Depression-specific strengthening.
+       */
+
+      if (
+        /\b(?:great depression|depression)\b/i.test(s) &&
+        /\b(?:caused by|causes included|caused|resulted from|stemmed from|triggered by|factors included)\b/i.test(s)
+      ) {
+        item.score += 180;
+      }
+
+      /*
+       * Penalize consequences when they don't explain
+       * the cause.
+       */
+
+      if (
+        /\b(?:recovery|stagnation|decline|aftermath|consequence|resulting economy|economic recovery)\b/i
+          .test(s) &&
+        !/\b(?:cause|caused|because|due to|factor|triggered|resulted from|stemmed from)\b/i
+          .test(s)
+      ) {
+        item.score -= 80;
+      }
+
+      if (
+        /\b(?:led to|resulted in|caused)\b/i.test(s) &&
+        !/\b(?:caused by|resulted from|stemmed from|because|due to|factor|cause of)\b/i.test(s)
+      ) {
+        item.score -= 35;
+      }
+    }
+  }
+
+
   scored.sort(
     (a, b) => b.score - a.score
   );
@@ -1325,8 +1436,15 @@ WHO:
 - Never infer the person's identity from a pronoun.
 
 WHEN:
-- Find the sentence containing the relevant date or time.
-- Prefer explicit dates over vague references.
+- Find the sentence containing the date or time of the specific event asked about.
+- The date must be connected to the event in the question.
+- Do NOT select a sentence merely because it contains a year, month, or date.
+- Do NOT select a citation fragment or background sentence that happens to contain a date.
+- For award questions, the selected passage must actually connect the date to the award or prize.
+- Prefer explicit wording such as "In 1903, Marie Curie was awarded..." or "Marie Curie won the Nobel Prize in 1903."
+- For launch questions, prefer wording such as "Apollo 11 launched on July 16, 1969."
+- For landing questions, prefer wording that connects the date directly to the landing.
+- If a candidate contains a date but does not establish when the requested event happened, do not select it.
 
 WHERE:
 - Find the sentence explicitly identifying the location.
@@ -1339,7 +1457,13 @@ HOW MANY / HOW MUCH:
 - Find the sentence containing the relevant quantity.
 
 WHY:
-- Find the sentence explaining the reason or cause.
+- Find the sentence explaining the actual reason or cause.
+- The selected sentence must connect the cause to the subject/event being asked about.
+- Prefer explicit causal wording such as "X was caused by Y", "The main cause was Y", "Factors included Y", or "X resulted from Y".
+- Do NOT select a downstream consequence merely because it contains words such as "caused", "led to", or "resulted".
+- For "What caused X?", a sentence saying "X led to Y" does NOT answer the question unless it also identifies what caused X.
+- Prefer causes, contributing factors, and direct explanations over consequences or aftermath.
+- If the page says multiple factors caused the event, select the passage that actually identifies those factors.
 
 WHAT:
 - Find the sentence that directly defines or explains the requested thing.
@@ -1765,12 +1889,6 @@ function shouldUseDeterministicOverride(
       return true;
     }
 
-
-    /*
-     * Lunar orbit must actually contain the relevant
-     * action and location.
-     */
-
     if (
       /\b(?:lunar orbit|orbit)\b/i.test(info.raw) &&
       /\b(?:stayed|remained)\b/i.test(info.raw)
@@ -1785,31 +1903,16 @@ function shouldUseDeterministicOverride(
       }
     }
 
-
     /*
-     * ======================================================
      * RELATIONSHIP
-     * ======================================================
      */
 
     if (info.isRelationship) {
-
-      /*
-       * This is the key protection against:
-       *
-       * "her husband joined..."
-       */
-
       if (
         /\b(?:her|his|their)\s+(?:husband|wife|spouse)\b/i.test(passage)
       ) {
         return true;
       }
-
-      /*
-       * A relationship answer must explicitly identify
-       * the person.
-       */
 
       if (
         !hasExplicitRelationshipIdentity(
@@ -1819,11 +1922,6 @@ function shouldUseDeterministicOverride(
       ) {
         return true;
       }
-
-      /*
-       * Parenthetical relationship mentions are not enough
-       * unless the relationship is explicitly established.
-       */
 
       if (
         /[\(\[]/.test(passage) &&
@@ -1856,17 +1954,169 @@ function shouldUseDeterministicOverride(
    * ========================================================
    * WHEN
    * ========================================================
+   *
+   * The old check only asked:
+   *
+   * "Does this sentence contain a date?"
+   *
+   * That allowed the Marie Curie failure:
+   *
+   * date + unrelated Nobel/citation sentence.
+   *
+   * Now the sentence must contain a date AND language
+   * connecting that date to the requested event.
+   * ========================================================
    */
 
   if (info.isWhen) {
+    const hasDate =
+      /\b(?:19|20)\d{2}\b/.test(passage) ||
+      /\b(?:january|february|march|april|may|june|july|august|september|october|november|december)\b/i.test(passage) ||
+      /\b\d{1,2}:\d{2}\b/.test(passage);
+
+    if (!hasDate) {
+      return true;
+    }
+
+    /*
+     * Award-specific validation.
+     */
+
     if (
-      !(
-        /\b(?:19|20)\d{2}\b/.test(passage) ||
-        /\b(?:january|february|march|april|may|june|july|august|september|october|november|december)\b/i.test(passage) ||
-        /\b\d{1,2}:\d{2}\b/.test(passage)
-      )
+      /\b(?:nobel|prize|award)\b/i.test(info.raw)
+    ) {
+      if (
+        !/\b(?:nobel|prize|award|awarded|won|received)\b/i.test(passage)
+      ) {
+        return true;
+      }
+
+      /*
+       * A date + "Nobel" is still not enough if the
+       * sentence doesn't connect the two.
+       */
+
+      const awardConnection =
+        /\b(?:won|received|awarded|was awarded|awarded the|won the|received the)\b/i
+          .test(passage);
+
+      if (!awardConnection) {
+        return true;
+      }
+    }
+
+    /*
+     * General event/date validation.
+     */
+
+    const eventConnection =
+      /\b(?:occurred|happened|took place|began|started|ended|launched|landed|arrived|departed|born|died|married|won|received|awarded|was awarded|was born|was launched)\b/i
+        .test(passage);
+
+    /*
+     * If the question is a specific event question,
+     * require event wording rather than accepting an
+     * arbitrary historical sentence with a year.
+     */
+
+    if (!eventConnection) {
+      const questionTerms =
+        info.terms.filter(
+          term => term.length >= 4
+        );
+
+      const matchedTerms =
+        questionTerms.filter(
+          term =>
+            passage
+              .toLowerCase()
+              .includes(term)
+        ).length;
+
+      /*
+       * Permit a highly direct date sentence when it
+       * contains multiple important question terms.
+       */
+
+      if (
+        matchedTerms < 2
+      ) {
+        return true;
+      }
+    }
+  }
+
+
+  /*
+   * ========================================================
+   * WHY
+   * ========================================================
+   *
+   * Do not allow OpenAI to return a downstream consequence
+   * when the question asks for the cause.
+   * ========================================================
+   */
+
+  if (info.isWhy) {
+    const lower =
+      passage.toLowerCase();
+
+    const relevantTerms =
+      info.terms.filter(
+        term => term.length >= 4
+      );
+
+    const matchingTerms =
+      relevantTerms.filter(
+        term => lower.includes(term)
+      ).length;
+
+    const hasCauseLanguage =
+      /\b(?:because|due to|since|as a result of|reason|caused by|caused|cause|causes|resulted from|resulting from|triggered|contributed to|contributing to|led to|stemmed from|arose from|driven by|in response to)\b/i
+        .test(passage);
+
+    /*
+     * If there is no cause language and very little
+     * connection to the question, reject it.
+     */
+
+    if (
+      !hasCauseLanguage &&
+      matchingTerms < 2
     ) {
       return true;
+    }
+
+    /*
+     * Strongly reject pure consequence sentences.
+     */
+
+    if (
+      /\b(?:recovery|stagnation|decline|aftermath|consequence|resulting economy|economic recovery)\b/i
+        .test(passage) &&
+      !/\b(?:cause|caused|because|due to|factor|triggered|resulted from|stemmed from)\b/i
+        .test(passage)
+    ) {
+      return true;
+    }
+
+    /*
+     * "X led to Y" is not automatically an answer to
+     * "What caused X?"
+     */
+
+    if (
+      /\b(?:led to|resulted in|caused)\b/i.test(passage) &&
+      !/\b(?:caused by|resulted from|stemmed from|because|due to|factor|cause of)\b/i.test(passage)
+    ) {
+      /*
+       * Keep it only if it has strong question-term overlap.
+       * Otherwise use the deterministic cause search.
+       */
+
+      if (matchingTerms < 3) {
+        return true;
+      }
     }
   }
 
