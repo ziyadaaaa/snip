@@ -1,7 +1,8 @@
 export default async function handler(req, res) {
-  // -----------------------------
+  // ======================================================
   // CORS
-  // -----------------------------
+  // ======================================================
+
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type");
@@ -31,17 +32,23 @@ export default async function handler(req, res) {
       });
     }
 
+    // ====================================================
+    // Clean page blocks
+    // ====================================================
+
     const cleanedBlocks = blocks
       .map((block, i) => ({
         index: Number.isInteger(block?.index)
           ? block.index
           : i,
 
-        text: String(block?.text || "").trim(),
+        text: String(block?.text || "")
+          .replace(/\s+/g, " ")
+          .trim(),
 
         kind: block?.kind || "text",
 
-        section: block?.section || ""
+        section: String(block?.section || "").trim()
       }))
       .filter(block => block.text.length > 0);
 
@@ -61,139 +68,114 @@ export default async function handler(req, res) {
       });
     }
 
-    // --------------------------------------------------
-    // Split blocks into sentences.
-    // Each sentence keeps its original block index.
-    // --------------------------------------------------
+    // ====================================================
+    // Question analysis
+    // ====================================================
+
+    const questionInfo = analyzeQuestion(question);
+
+    // ====================================================
+    // Build ALL sentences
+    //
+    // We no longer simply take the first 700 sentences.
+    // We rank the whole page first.
+    // ====================================================
 
     const sentences = [];
 
     for (const block of cleanedBlocks) {
       const parts = splitIntoSentences(block.text);
 
-      for (const sentence of parts) {
-        const clean = sentence.trim();
+      for (let i = 0; i < parts.length; i++) {
+        const sentence = parts[i].trim();
 
-        if (!clean) continue;
+        if (!sentence) continue;
 
         sentences.push({
+          id: sentences.length,
           block_index: block.index,
-          sentence: clean,
+          sentence,
           section: block.section,
-          kind: block.kind
+          kind: block.kind,
+          sentence_index: i
         });
       }
     }
 
-    // Keep enough context for long pages.
-    const MAX_SENTENCES = 700;
+    if (!sentences.length) {
+      return res.status(200).json({
+        evidence: []
+      });
+    }
 
-    const sentenceCandidates =
-      sentences.slice(0, MAX_SENTENCES);
+    // ====================================================
+    // Rank sentences locally
+    // ====================================================
 
-    // --------------------------------------------------
-    // Detect question intent
-    // --------------------------------------------------
+    const ranked = sentences
+      .map(item => ({
+        ...item,
+        score: scoreSentence(
+          item,
+          questionInfo
+        )
+      }))
+      .sort((a, b) => b.score - a.score);
 
-    const q = question.toLowerCase().trim();
+    // ====================================================
+    // Select a compact but strong candidate set.
+    //
+    // Include neighbors so GPT has enough context without
+    // drowning the model in hundreds of unrelated sentences.
+    // ====================================================
 
-    const isDuration =
-      /\bhow long\b/.test(q) ||
-      /\bhow many (hours|minutes|days|weeks|months|years)\b/.test(q) ||
-      /\bwhat was the duration\b/.test(q);
+    const selected = selectCandidates(
+      ranked,
+      sentences,
+      questionInfo
+    );
 
-    const isLocation =
-      /\bwhere\b/.test(q) ||
-      /\bwhere exactly\b/.test(q) ||
-      /\bwhat location\b/.test(q) ||
-      /\bwhich location\b/.test(q);
-
-    const isWho =
-      /\bwho\b/.test(q);
-
-    const isWhen =
-      /\bwhen\b/.test(q) ||
-      /\bwhat date\b/.test(q) ||
-      /\bwhat time\b/.test(q);
-
-    // --------------------------------------------------
-    // Add deterministic hints.
-    // --------------------------------------------------
-
-    const candidateText = sentenceCandidates
+    const candidateText = selected
       .map((item, i) => {
-        let hint = "";
+        const hints = [];
 
-        const s = item.sentence.toLowerCase();
-
-        if (isDuration) {
-          if (
-            /\d+(?:\.\d+)?\s*(hours?|hrs?|minutes?|mins?|days?|weeks?|months?|years?)\b/.test(s) ||
-            /\bmore than\b/.test(s) ||
-            /\bless than\b/.test(s) ||
-            /\bapproximately\b/.test(s) ||
-            /\babout\b/.test(s)
-          ) {
-            hint = " [DURATION-CANDIDATE]";
-          }
-
-          // Explicitly mark activity durations as weaker.
-          if (
-            /\ballotted\b/.test(s) ||
-            /\bsample collection\b/.test(s) ||
-            /\bdocumenting\b/.test(s) ||
-            /\bhalfway\b/.test(s) ||
-            /\bactivity\b/.test(s)
-          ) {
-            hint += " [ACTIVITY-DURATION]";
-          }
-
-          // Strong signal for total lunar/surface stay.
-          if (
-            /\bon the lunar surface\b/.test(s) ||
-            /\bon the surface\b/.test(s) ||
-            /\bon the moon\b/.test(s)
-          ) {
-            hint += " [SURFACE-STAY]";
-          }
+        if (item.score >= 80) {
+          hints.push("STRONG-CANDIDATE");
         }
 
-        if (isLocation) {
-          if (
-            /\blanding\b/.test(s) ||
-            /\blanded\b/.test(s) ||
-            /\bdescended\b/.test(s) ||
-            /\barrived\b/.test(s) ||
-            /\breached\b/.test(s) ||
-            /\btouched down\b/.test(s)
-          ) {
-            hint += " [LOCATION-CANDIDATE]";
-          }
-
-          if (
-            /\bsaw\b/.test(s) &&
-            /\blanding site\b/.test(s)
-          ) {
-            hint += " [OBSERVATION-NOT-ACTUAL-LANDING]";
-          }
+        if (questionInfo.isDuration &&
+            hasDuration(item.sentence)) {
+          hints.push("HAS-DURATION");
         }
 
-        if (isWhen) {
-          if (
-            /\b\d{4}\b/.test(s) ||
-            /\bjan(?:uary)?\b|\bfeb(?:ruary)?\b|\bmar(?:ch)?\b|\bapr(?:il)?\b|\bmay\b|\bjun(?:e)?\b|\bjul(?:y)?\b|\baug(?:ust)?\b|\bsep(?:tember)?\b|\boct(?:ober)?\b|\bnov(?:ember)?\b|\bdec(?:ember)?\b/.test(s)
-          ) {
-            hint += " [TIME-CANDIDATE]";
-          }
+        if (questionInfo.isLocation &&
+            hasLocationSignal(item.sentence)) {
+          hints.push("HAS-LOCATION");
         }
 
-        return `[${i}] block=${item.block_index}${hint}\n${item.sentence}`;
+        if (questionInfo.isWho &&
+            hasPersonSignal(item.sentence)) {
+          hints.push("HAS-PERSON");
+        }
+
+        if (questionInfo.isWhen &&
+            hasDateSignal(item.sentence)) {
+          hints.push("HAS-DATE");
+        }
+
+        return [
+          `[${i}]`,
+          `block=${item.block_index}`,
+          `score=${item.score}`,
+          hints.length ? hints.join(" ") : "",
+          item.sentence
+        ].filter(Boolean).join(" ");
       })
       .join("\n\n");
 
-    // --------------------------------------------------
-    // Ask OpenAI for EXACT answer sentence.
-    // --------------------------------------------------
+    // ====================================================
+    // Ask OpenAI to select exact evidence
+    // ====================================================
 
     const prompt = `
 You are Snip, an exact-location webpage retrieval system.
@@ -201,69 +183,80 @@ You are Snip, an exact-location webpage retrieval system.
 USER QUESTION:
 ${question}
 
-Your job is NOT to summarize the page.
+Your job is NOT to summarize the webpage.
 
-Your job is to identify the SINGLE sentence from the supplied webpage that most directly answers the user's question.
+Your job is to find the exact sentence or sentences on the supplied webpage that directly answer the user's question.
 
-CRITICAL RULES:
+IMPORTANT:
+The webpage may contain many related sentences.
+Do NOT choose a sentence just because it shares keywords with the question.
 
-1. Return ONLY ONE sentence whenever one sentence directly answers the question.
-2. Prefer the smallest possible evidence passage.
-3. Do NOT return an entire paragraph.
-4. Do NOT combine multiple unrelated sentences.
-5. Do NOT choose a sentence merely because it contains related words.
-6. Choose the sentence that actually answers the question.
-7. The passage MUST be copied exactly from the webpage.
+Choose the sentence that actually answers the question.
 
-QUESTION TYPE RULES:
+RULES:
 
-If the question asks "HOW LONG":
+1. Prefer ONE sentence when one sentence directly answers the question.
+2. Use TWO sentences only when the answer genuinely requires both.
+3. Prefer the smallest possible evidence.
+4. Never invent information.
+5. Never answer from general knowledge.
+6. The passage MUST be copied exactly from the supplied webpage sentence.
+7. Do not rewrite the sentence.
+8. Do not combine unrelated sentences.
+9. Do not choose a sentence merely because it contains a date, name, number, or location.
+10. If the webpage does not contain the answer, return an empty evidence array.
 
-- Prefer the sentence containing the actual duration of the event, stay, journey, or period being asked about.
-- Look for hours, minutes, days, weeks, months, years, etc.
-- Determine WHAT the duration refers to.
-- Do NOT confuse the duration of a small activity with the duration of the overall event.
-- If the question asks how long people stayed somewhere, prefer a sentence explicitly describing their time at that location.
-- For example, if the page says:
-  "After more than 21 hours on the surface, they rejoined Collins in lunar orbit..."
-  that is the correct evidence for:
-  "How long did the astronauts stay on the Moon?"
-- A sentence such as:
-  "they had to stop documenting sample collection halfway through the allotted 34 minutes."
-  is NOT the answer to the total-stay question because 34 minutes describes an individual activity.
+QUESTION TYPE:
 
-If the question asks "WHERE":
+WHO:
+- Find the sentence that explicitly identifies the requested person or people.
+- Prefer a sentence describing their role/action in the event asked about.
+- Do not select an unrelated sentence merely because it contains a person's name.
 
-- Choose the sentence describing where the event actually occurred.
-- Prefer sentences containing "landed", "landing", "descended", "arrived", "reached", or "touched down".
-- Do NOT choose a sentence merely saying people later saw, viewed, mapped, or observed the location.
-- For example:
-  "Armstrong and Aldrin descended to the surface aboard the LM Eagle, landing in the Sea of Tranquility..."
-  is correct for "Where did Apollo 11 land?"
-- A sentence saying "the crew saw passing views of their landing site..." is NOT the answer.
+WHEN:
+- Find the date/time that specifically answers the event in the question.
+- Do not choose an earlier or later date simply because it is prominent.
 
-If the question asks WHO:
+WHERE:
+- Find where the event actually occurred.
+- For a landing question, prefer the actual landing location.
+- Do not select a sentence saying someone later viewed, observed, photographed, or mapped the location.
 
-- Choose the sentence that explicitly identifies the person.
+HOW LONG:
+- Find the duration of the specific event/stay/period asked about.
+- Distinguish total duration from durations of individual activities.
+- For a question asking how long people stayed somewhere, prefer explicit stay/surface/location duration.
+- Do not select "34 minutes" merely because it is a duration if the question asks about an entire mission or stay.
 
-If the question asks WHEN:
+HOW MANY:
+- Find the number that answers the specific quantity requested.
+- Do not choose another nearby number.
 
-- Choose the sentence containing the relevant date, time, or event timing.
+WHY:
+- Find the sentence explaining the cause/reason.
+- Do not choose a sentence merely describing the event.
 
-Return JSON only in this format:
+WHAT:
+- Find the sentence that directly defines, identifies, or explains the thing being asked about.
+
+WHICH:
+- Find the sentence that identifies the requested item.
+
+The candidate list has been locally ranked before reaching you.
+Higher scores are useful signals, but you must still verify the actual meaning.
+
+Return JSON only:
 
 {
   "evidence": [
     {
       "block_index": 123,
-      "passage": "exact sentence copied from the page"
+      "passage": "exact sentence copied from the webpage"
     }
   ]
 }
 
-Return an empty evidence array only if the page truly does not contain the answer.
-
-WEBPAGE SENTENCES:
+WEBPAGE CANDIDATES:
 
 ${candidateText}
 `;
@@ -278,12 +271,14 @@ ${candidateText}
       !parsed ||
       !Array.isArray(parsed.evidence)
     ) {
-      throw new Error("Invalid model response");
+      throw new Error(
+        "Invalid model response"
+      );
     }
 
-    // --------------------------------------------------
-    // Validate returned evidence.
-    // --------------------------------------------------
+    // ====================================================
+    // Validate model evidence
+    // ====================================================
 
     const validEvidence = [];
 
@@ -323,15 +318,15 @@ ${candidateText}
       }
     }
 
-    // --------------------------------------------------
-    // Precision override
-    // --------------------------------------------------
+    // ====================================================
+    // Precision / semantic validation
+    // ====================================================
 
     if (
       validEvidence.length === 0 ||
       needsPrecisionOverride(
         validEvidence,
-        question
+        questionInfo
       )
     ) {
       const fallback =
@@ -345,10 +340,32 @@ ${candidateText}
           evidence: [fallback]
         });
       }
+
+      return res.status(200).json({
+        evidence: []
+      });
+    }
+
+    // ====================================================
+    // Remove duplicate evidence
+    // ====================================================
+
+    const uniqueEvidence = [];
+
+    const seen = new Set();
+
+    for (const item of validEvidence) {
+      const key =
+        `${item.block_index}|${normalizeText(item.passage)}`;
+
+      if (seen.has(key)) continue;
+
+      seen.add(key);
+      uniqueEvidence.push(item);
     }
 
     return res.status(200).json({
-      evidence: validEvidence
+      evidence: uniqueEvidence
     });
 
   } catch (error) {
@@ -365,7 +382,790 @@ ${candidateText}
 
 
 // ======================================================
-// OpenAI
+// QUESTION ANALYSIS
+// ======================================================
+
+function analyzeQuestion(question) {
+  const q =
+    String(question || "")
+      .toLowerCase()
+      .trim();
+
+  return {
+    raw: q,
+
+    isWho:
+      /\bwho\b/.test(q),
+
+    isWhen:
+      /\bwhen\b/.test(q) ||
+      /\bwhat date\b/.test(q) ||
+      /\bwhat time\b/.test(q),
+
+    isWhere:
+      /\bwhere\b/.test(q) ||
+      /\bwhat location\b/.test(q) ||
+      /\bwhich location\b/.test(q),
+
+    isDuration:
+      /\bhow long\b/.test(q) ||
+      /\bhow many\s+(hours?|minutes?|days?|weeks?|months?|years?)\b/.test(q) ||
+      /\bwhat was the duration\b/.test(q),
+
+    isHowMany:
+      /\bhow many\b/.test(q) ||
+      /\bhow much\b/.test(q),
+
+    isWhy:
+      /\bwhy\b/.test(q) ||
+      /\bwhat caused\b/.test(q) ||
+      /\bwhat was the cause\b/.test(q),
+
+    isWhat:
+      /^\s*what\b/.test(q),
+
+    isWhich:
+      /\bwhich\b/.test(q),
+
+    terms: extractQuestionTerms(q)
+  };
+}
+
+
+// ======================================================
+// QUESTION TERMS
+// ======================================================
+
+function extractQuestionTerms(q) {
+  const stopWords = new Set([
+    "what",
+    "when",
+    "where",
+    "who",
+    "why",
+    "which",
+    "how",
+    "long",
+    "many",
+    "much",
+    "was",
+    "were",
+    "is",
+    "are",
+    "did",
+    "do",
+    "does",
+    "the",
+    "a",
+    "an",
+    "of",
+    "to",
+    "in",
+    "on",
+    "at",
+    "for",
+    "and",
+    "or",
+    "from",
+    "with",
+    "about",
+    "this",
+    "that",
+    "it",
+    "they",
+    "he",
+    "she",
+    "their",
+    "his",
+    "her",
+    "people",
+    "person",
+    "event"
+  ]);
+
+  return q
+    .replace(/[^\p{L}\p{N}\s'-]/gu, " ")
+    .split(/\s+/)
+    .map(word => word.trim())
+    .filter(
+      word =>
+        word.length >= 2 &&
+        !stopWords.has(word)
+    );
+}
+
+
+// ======================================================
+// LOCAL SENTENCE SCORING
+// ======================================================
+
+function scoreSentence(
+  item,
+  info
+) {
+  const s =
+    item.sentence.toLowerCase();
+
+  const section =
+    item.section.toLowerCase();
+
+  let score = 0;
+
+  // ----------------------------------------------------
+  // Question term overlap
+  // ----------------------------------------------------
+
+  for (const term of info.terms) {
+    if (!term) continue;
+
+    if (containsWord(s, term)) {
+      score += 12;
+    }
+
+    // Small boost for exact phrase fragments.
+    if (
+      term.length >= 6 &&
+      s.includes(term)
+    ) {
+      score += 5;
+    }
+
+    if (
+      section &&
+      containsWord(section, term)
+    ) {
+      score += 3;
+    }
+  }
+
+  // ----------------------------------------------------
+  // WHO
+  // ----------------------------------------------------
+
+  if (info.isWho) {
+    if (hasPersonSignal(item.sentence)) {
+      score += 35;
+    }
+
+    if (
+      /\bwas\b|\bwere\b|\bbecome\b|\bbecame\b|\bserved\b|\bled\b|\bcommanded\b|\bpiloted\b|\bflew\b|\bstayed\b|\bremained\b/.test(s)
+    ) {
+      score += 20;
+    }
+
+    if (
+      /\baccording to\b|\bsaid\b|\breported\b/.test(s)
+    ) {
+      score += 5;
+    }
+  }
+
+  // ----------------------------------------------------
+  // WHEN
+  // ----------------------------------------------------
+
+  if (info.isWhen) {
+    if (hasDateSignal(item.sentence)) {
+      score += 55;
+    }
+
+    if (
+      /\bstarted\b|\bbegan\b|\bended\b|\bended on\b|\blaunched\b|\bsank\b|\bdied\b|\barrived\b|\boccurred\b|\btook place\b/.test(s)
+    ) {
+      score += 35;
+    }
+  }
+
+  // ----------------------------------------------------
+  // WHERE
+  // ----------------------------------------------------
+
+  if (info.isWhere) {
+    if (hasLocationSignal(item.sentence)) {
+      score += 45;
+    }
+
+    if (
+      /\blanded\b|\blanding\b|\btouched down\b|\barrived\b|\bdescended\b|\breached\b|\boccurred\b|\btook place\b/.test(s)
+    ) {
+      score += 45;
+    }
+
+    if (
+      /\bsaw\b.*\blanding site\b/.test(s) ||
+      /\bpassing views\b/.test(s)
+    ) {
+      score -= 90;
+    }
+  }
+
+  // ----------------------------------------------------
+  // HOW LONG
+  // ----------------------------------------------------
+
+  if (info.isDuration) {
+    if (hasDuration(item.sentence)) {
+      score += 70;
+    }
+
+    if (
+      /\bafter\b.*\bhours?\b.*\bsurface\b/.test(s)
+    ) {
+      score += 70;
+    }
+
+    if (
+      /\bon the (?:lunar )?surface\b/.test(s)
+    ) {
+      score += 55;
+    }
+
+    if (
+      /\bon the moon\b/.test(s)
+    ) {
+      score += 55;
+    }
+
+    // Activity duration penalties.
+    if (
+      /\ballotted\b|\ballocated\b|\bsample collection\b|\bdocumenting\b|\bhalfway\b|\bactivity\b|\bexperiment\b/.test(s)
+    ) {
+      score -= 110;
+    }
+  }
+
+  // ----------------------------------------------------
+  // HOW MANY
+  // ----------------------------------------------------
+
+  if (info.isHowMany) {
+    if (
+      /\b\d+(?:\.\d+)?\b/.test(s) ||
+      /\b(?:one|two|three|four|five|six|seven|eight|nine|ten|hundred|thousand|million)\b/.test(s)
+    ) {
+      score += 50;
+    }
+  }
+
+  // ----------------------------------------------------
+  // WHY
+  // ----------------------------------------------------
+
+  if (info.isWhy) {
+    if (
+      /\bbecause\b|\bdue to\b|\bso that\b|\bin order to\b|\bcaused by\b|\bresulted from\b|\breason\b|\bwhy\b/.test(s)
+    ) {
+      score += 70;
+    }
+
+    if (
+      /\btherefore\b|\bconsequently\b|\bas a result\b/.test(s)
+    ) {
+      score += 30;
+    }
+  }
+
+  // ----------------------------------------------------
+  // WHAT
+  // ----------------------------------------------------
+
+  if (info.isWhat) {
+    if (
+      /\bis a\b|\bis an\b|\bwas a\b|\bwas an\b|\brefers to\b|\bmeans\b|\bdefined as\b|\bknown as\b/.test(s)
+    ) {
+      score += 35;
+    }
+  }
+
+  // ----------------------------------------------------
+  // WHICH
+  // ----------------------------------------------------
+
+  if (info.isWhich) {
+    score += 15;
+
+    if (
+      /\bwas\b|\bwere\b|\bis\b|\bare\b|\bchosen\b|\bselected\b|\bused\b/.test(s)
+    ) {
+      score += 20;
+    }
+  }
+
+  // ----------------------------------------------------
+  // Strong exact-answer patterns
+  // ----------------------------------------------------
+
+  if (
+    /\bthe first\b|\bthe only\b|\bthe main\b|\bthe cause\b|\bthe reason\b/.test(s)
+  ) {
+    score += 8;
+  }
+
+  // ----------------------------------------------------
+  // Penalize navigation / metadata / weak sentences
+  // ----------------------------------------------------
+
+  if (
+    /\bcookie\b|\bprivacy policy\b|\bsubscribe\b|\bsign up\b|\blog in\b|\badvertisement\b/.test(s)
+  ) {
+    score -= 80;
+  }
+
+  if (
+    item.kind === "h1" ||
+    item.kind === "h2" ||
+    item.kind === "h3"
+  ) {
+    score += 3;
+  }
+
+  return score;
+}
+
+
+// ======================================================
+// CANDIDATE SELECTION
+// ======================================================
+
+function selectCandidates(
+  ranked,
+  allSentences,
+  info
+) {
+  const selected = [];
+  const selectedIds = new Set();
+
+  // Take the strongest direct candidates.
+  for (const item of ranked.slice(0, 30)) {
+    if (item.score <= 0) continue;
+
+    addCandidateWithNeighbors(
+      item,
+      allSentences,
+      selected,
+      selectedIds
+    );
+
+    if (selected.length >= 90) {
+      break;
+    }
+  }
+
+  // If local ranking is weak, still give GPT some page content.
+  if (selected.length < 12) {
+    for (const item of ranked.slice(0, 20)) {
+      addCandidateWithNeighbors(
+        item,
+        allSentences,
+        selected,
+        selectedIds
+      );
+
+      if (selected.length >= 60) {
+        break;
+      }
+    }
+  }
+
+  // Keep deterministic ordering by original page position.
+  return selected
+    .sort((a, b) => a.id - b.id)
+    .slice(0, 100);
+}
+
+
+function addCandidateWithNeighbors(
+  item,
+  allSentences,
+  selected,
+  selectedIds
+) {
+  const position =
+    allSentences.findIndex(
+      candidate =>
+        candidate.id === item.id
+    );
+
+  if (position === -1) return;
+
+  const start =
+    Math.max(0, position - 1);
+
+  const end =
+    Math.min(
+      allSentences.length - 1,
+      position + 1
+    );
+
+  for (
+    let i = start;
+    i <= end;
+    i++
+  ) {
+    const candidate =
+      allSentences[i];
+
+    if (selectedIds.has(candidate.id)) {
+      continue;
+    }
+
+    selectedIds.add(candidate.id);
+
+    selected.push({
+      ...candidate,
+
+      // Preserve original ranking.
+      score:
+        candidate.id === item.id
+          ? item.score
+          : scoreNeighbor(candidate)
+    });
+  }
+}
+
+
+function scoreNeighbor(item) {
+  return 1;
+}
+
+
+// ======================================================
+// DETERMINISTIC PRECISION CHECK
+// ======================================================
+
+function needsPrecisionOverride(
+  evidence,
+  info
+) {
+  if (!evidence.length) {
+    return true;
+  }
+
+  const passage =
+    evidence[0].passage.toLowerCase();
+
+  // ----------------------------------------------------
+  // Duration
+  // ----------------------------------------------------
+
+  if (info.isDuration) {
+    if (!hasDuration(passage)) {
+      return true;
+    }
+
+    if (
+      /\ballotted\b|\ballocated\b|\bactivity\b|\bsample collection\b|\bdocumenting\b|\bhalfway\b|\bexperiment\b/.test(passage)
+    ) {
+      return true;
+    }
+
+    // If the question is clearly about a stay on a
+    // surface/location, require a stay signal.
+    if (
+      /\bmoon\b|\blunar\b|\bsurface\b/.test(info.raw)
+    ) {
+      if (
+        !/\bsurface\b|\bmoon\b|\blunar stay\b/.test(passage)
+      ) {
+        return true;
+      }
+    }
+  }
+
+  // ----------------------------------------------------
+  // Location
+  // ----------------------------------------------------
+
+  if (info.isWhere) {
+    if (
+      /\bsaw\b.*\blanding site\b/.test(passage) ||
+      /\bpassing views\b/.test(passage)
+    ) {
+      return true;
+    }
+  }
+
+  // ----------------------------------------------------
+  // When
+  // ----------------------------------------------------
+
+  if (info.isWhen) {
+    if (!hasDateSignal(passage)) {
+      return true;
+    }
+  }
+
+  // ----------------------------------------------------
+  // Who
+  // ----------------------------------------------------
+
+  if (info.isWho) {
+    if (!hasPersonSignal(passage)) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+
+// ======================================================
+// DETERMINISTIC FALLBACK
+// ======================================================
+
+function findBestDeterministicSentence(
+  question,
+  blocks
+) {
+  const info =
+    analyzeQuestion(question);
+
+  const sentences = [];
+
+  for (const block of blocks) {
+    for (
+      const sentence of
+      splitIntoSentences(block.text)
+    ) {
+      const clean =
+        sentence.trim();
+
+      if (!clean) continue;
+
+      sentences.push({
+        block_index: block.index,
+        passage: clean,
+        score: scoreSentence(
+          {
+            sentence: clean,
+            section: block.section || "",
+            kind: block.kind || "text"
+          },
+          info
+        )
+      });
+    }
+  }
+
+  if (!sentences.length) {
+    return null;
+  }
+
+  // Additional deterministic intent-specific scoring.
+  for (const item of sentences) {
+    const s =
+      item.passage.toLowerCase();
+
+    // --------------------------------------------------
+    // Duration
+    // --------------------------------------------------
+
+    if (info.isDuration) {
+      if (hasDuration(s)) {
+        item.score += 100;
+      }
+
+      if (
+        /\bon the (?:lunar )?surface\b/.test(s) ||
+        /\bon the moon\b/.test(s)
+      ) {
+        item.score += 90;
+      }
+
+      if (
+        /\bafter\b.*\bhours?\b.*\bsurface\b/.test(s)
+      ) {
+        item.score += 100;
+      }
+
+      if (
+        /\ballotted\b|\ballocated\b|\bsample collection\b|\bdocumenting\b|\bhalfway\b|\bactivity\b|\bexperiment\b/.test(s)
+      ) {
+        item.score -= 200;
+      }
+    }
+
+    // --------------------------------------------------
+    // Location
+    // --------------------------------------------------
+
+    if (info.isWhere) {
+      if (
+        /\blanding in\b|\blanded in\b|\btouched down\b/.test(s)
+      ) {
+        item.score += 160;
+      }
+
+      if (
+        /\bdescended to the surface\b/.test(s)
+      ) {
+        item.score += 100;
+      }
+
+      if (
+        /\bsaw\b.*\blanding site\b/.test(s) ||
+        /\bpassing views\b/.test(s)
+      ) {
+        item.score -= 200;
+      }
+    }
+
+    // --------------------------------------------------
+    // Who
+    // --------------------------------------------------
+
+    if (info.isWho) {
+      if (
+        hasPersonSignal(s)
+      ) {
+        item.score += 80;
+      }
+
+      if (
+        /\bremained\b|\bstayed\b|\bserved\b|\bled\b|\bcommanded\b|\bpiloted\b|\bflew\b|\bbecame\b|\bwas the first\b/.test(s)
+      ) {
+        item.score += 60;
+      }
+    }
+
+    // --------------------------------------------------
+    // When
+    // --------------------------------------------------
+
+    if (info.isWhen) {
+      if (hasDateSignal(s)) {
+        item.score += 100;
+      }
+
+      if (
+        /\bstarted\b|\bbegan\b|\blaunched\b|\bsank\b|\bended\b|\bended on\b|\barrived\b|\boccurred\b|\btook place\b/.test(s)
+      ) {
+        item.score += 60;
+      }
+    }
+
+    // --------------------------------------------------
+    // Why
+    // --------------------------------------------------
+
+    if (info.isWhy) {
+      if (
+        /\bbecause\b|\bdue to\b|\bcaused by\b|\bresulted from\b|\breason\b/.test(s)
+      ) {
+        item.score += 100;
+      }
+    }
+  }
+
+  const sorted =
+    sentences
+      .filter(item => item.score > 0)
+      .sort(
+        (a, b) =>
+          b.score - a.score
+      );
+
+  if (!sorted.length) {
+    return null;
+  }
+
+  // Don't return an obviously invalid answer.
+  for (const item of sorted) {
+    if (
+      !needsPrecisionOverride(
+        [item],
+        info
+      )
+    ) {
+      return {
+        block_index:
+          item.block_index,
+
+        passage:
+          item.passage
+      };
+    }
+  }
+
+  return null;
+}
+
+
+// ======================================================
+// SIGNAL HELPERS
+// ======================================================
+
+function hasDuration(text) {
+  return /\b(?:more than|less than|about|approximately|around|nearly|roughly)?\s*\d+(?:\.\d+)?\s*(?:hours?|hrs?|minutes?|mins?|days?|weeks?|months?|years?)\b/i
+    .test(String(text || ""));
+}
+
+
+function hasDateSignal(text) {
+  const s =
+    String(text || "");
+
+  return (
+    /\b\d{1,2}\s+(?:January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{4}\b/i.test(s) ||
+
+    /\b(?:January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{1,2}(?:,\s*\d{4})?\b/i.test(s) ||
+
+    /\b(?:19|20)\d{2}\b/.test(s) ||
+
+    /\b\d{1,2}:\d{2}\s*(?:UTC|GMT|AM|PM)?\b/i.test(s)
+  );
+}
+
+
+function hasLocationSignal(text) {
+  const s =
+    String(text || "").toLowerCase();
+
+  return (
+    /\blanded\b/.test(s) ||
+    /\blanding\b/.test(s) ||
+    /\btouched down\b/.test(s) ||
+    /\bdescended\b/.test(s) ||
+    /\barrived\b/.test(s) ||
+    /\breached\b/.test(s) ||
+    /\bin the\b/.test(s) ||
+    /\bat the\b/.test(s)
+  );
+}
+
+
+function hasPersonSignal(text) {
+  const s =
+    String(text || "");
+
+  return (
+    /\b(?:he|she|they|him|her|them)\b/i.test(s) ||
+
+    /\b(?:Mr\.|Mrs\.|Ms\.|Dr\.|Captain|Commander|President|Professor)\s+[A-Z][A-Za-z'-]+/i.test(s) ||
+
+    /\b[A-Z][a-z'-]+\s+[A-Z][a-z'-]+\b/.test(s)
+  );
+}
+
+
+function containsWord(text, word) {
+  if (!word) return false;
+
+  const escaped =
+    word.replace(
+      /[.*+?^${}()|[\]\\]/g,
+      "\\$&"
+    );
+
+  return new RegExp(
+    `\\b${escaped}\\b`,
+    "i"
+  ).test(text);
+}
+
+
+// ======================================================
+// OPENAI RESPONSES API
 // ======================================================
 
 async function callOpenAI(
@@ -390,7 +1190,7 @@ async function callOpenAI(
       }
     ],
 
-    max_output_tokens: 1200,
+    max_output_tokens: 900,
 
     text: {
       format: {
@@ -447,19 +1247,20 @@ async function callOpenAI(
     attempt < 3;
     attempt++
   ) {
-    const response = await fetch(
-      "https://api.openai.com/v1/responses",
-      {
-        method: "POST",
+    const response =
+      await fetch(
+        "https://api.openai.com/v1/responses",
+        {
+          method: "POST",
 
-        headers: {
-          "Content-Type": "application/json",
-          "Authorization": `Bearer ${apiKey}`
-        },
+          headers: {
+            "Content-Type": "application/json",
+            "Authorization": `Bearer ${apiKey}`
+          },
 
-        body: JSON.stringify(body)
-      }
-    );
+          body: JSON.stringify(body)
+        }
+      );
 
     const text =
       await response.text();
@@ -490,7 +1291,8 @@ async function callOpenAI(
     let data;
 
     try {
-      data = JSON.parse(text);
+      data =
+        JSON.parse(text);
     } catch {
       throw new Error(
         "Invalid OpenAI response"
@@ -527,7 +1329,7 @@ async function callOpenAI(
 
 
 // ======================================================
-// Extract Responses API text
+// EXTRACT RESPONSE TEXT
 // ======================================================
 
 function extractOutputText(data) {
@@ -560,7 +1362,7 @@ function extractOutputText(data) {
 
 
 // ======================================================
-// Parse JSON returned by model
+// PARSE MODEL JSON
 // ======================================================
 
 function parseModelJSON(text) {
@@ -569,7 +1371,8 @@ function parseModelJSON(text) {
   } catch {}
 
   const match =
-    text.match(/\{[\s\S]*\}/);
+    String(text || "")
+      .match(/\{[\s\S]*\}/);
 
   if (!match) {
     return null;
@@ -586,13 +1389,14 @@ function parseModelJSON(text) {
 
 
 // ======================================================
-// Sentence splitting
+// SENTENCE SPLITTING
 // ======================================================
 
 function splitIntoSentences(text) {
-  const normalized = text
-    .replace(/\s+/g, " ")
-    .trim();
+  const normalized =
+    String(text || "")
+      .replace(/\s+/g, " ")
+      .trim();
 
   if (!normalized) {
     return [];
@@ -608,7 +1412,7 @@ function splitIntoSentences(text) {
 
 
 // ======================================================
-// Text normalization
+// TEXT NORMALIZATION
 // ======================================================
 
 function normalizeText(text) {
@@ -672,281 +1476,7 @@ function containsEquivalentText(
 
 
 // ======================================================
-// Precision override
-// ======================================================
-
-function needsPrecisionOverride(
-  evidence,
-  question
-) {
-  if (!evidence.length) {
-    return true;
-  }
-
-  const q =
-    question.toLowerCase();
-
-  const passage =
-    evidence[0].passage.toLowerCase();
-
-  // --------------------------------------------
-  // Duration questions
-  // --------------------------------------------
-
-  if (/\bhow long\b/.test(q)) {
-    const hasDuration =
-      /\b\d+(?:\.\d+)?\s*(hours?|hrs?|minutes?|mins?|days?|weeks?|months?|years?)\b/.test(passage) ||
-      /\bmore than\b/.test(passage) ||
-      /\bless than\b/.test(passage);
-
-    if (!hasDuration) {
-      return true;
-    }
-
-    // Reject durations belonging to a small activity.
-    const activityDuration =
-      /\ballotted\b/.test(passage) ||
-      /\ballotted time\b/.test(passage) ||
-      /\ballocated\b/.test(passage) ||
-      /\bactivity\b/.test(passage) ||
-      /\bsample collection\b/.test(passage) ||
-      /\bexperiment\b/.test(passage) ||
-      /\bdocumenting\b/.test(passage) ||
-      /\bminutes?\b/.test(passage) &&
-      (
-        /\bstop\b/.test(passage) ||
-        /\bhalfway\b/.test(passage) ||
-        /\bcollection\b/.test(passage)
-      );
-
-    if (activityDuration) {
-      return true;
-    }
-
-    // If asking how long someone stayed somewhere,
-    // require evidence that describes that stay.
-    const describesSurfaceStay =
-      /\bon the (?:lunar )?surface\b/.test(passage) ||
-      /\bon the moon\b/.test(passage) ||
-      /\bon the lunar surface\b/.test(passage) ||
-      /\blunar stay\b/.test(passage);
-
-    if (!describesSurfaceStay) {
-      return true;
-    }
-  }
-
-  // --------------------------------------------
-  // Location questions
-  // --------------------------------------------
-
-  if (/\bwhere\b/.test(q)) {
-    if (
-      /\bsaw\b/.test(passage) &&
-      /\blanding site\b/.test(passage)
-    ) {
-      return true;
-    }
-
-    if (
-      /\bpassing views\b/.test(passage)
-    ) {
-      return true;
-    }
-  }
-
-  return false;
-}
-
-
-// ======================================================
-// Deterministic fallback
-// ======================================================
-
-function findBestDeterministicSentence(
-  question,
-  blocks
-) {
-  const q =
-    question.toLowerCase();
-
-  const sentences = [];
-
-  for (const block of blocks) {
-    for (
-      const sentence of
-      splitIntoSentences(block.text)
-    ) {
-      const clean =
-        sentence.trim();
-
-      if (!clean) continue;
-
-      sentences.push({
-        block_index: block.index,
-        passage: clean,
-        score: 0
-      });
-    }
-  }
-
-  // --------------------------------------------
-  // Duration
-  // --------------------------------------------
-
-  if (/\bhow long\b/.test(q)) {
-    for (const item of sentences) {
-      const s =
-        item.passage.toLowerCase();
-
-      // Any explicit duration.
-      if (
-        /\b\d+(?:\.\d+)?\s*(hours?|hrs?|minutes?|mins?|days?|weeks?|months?|years?)\b/.test(s)
-      ) {
-        item.score += 100;
-      }
-
-      if (/\bmore than\b/.test(s)) {
-        item.score += 30;
-      }
-
-      if (/\bless than\b/.test(s)) {
-        item.score += 20;
-      }
-
-      // Strong signal for total time on the Moon.
-      if (
-        /\bon the (?:lunar )?surface\b/.test(s)
-      ) {
-        item.score += 70;
-      }
-
-      if (/\bon the moon\b/.test(s)) {
-        item.score += 70;
-      }
-
-      if (/\blunar surface\b/.test(s)) {
-        item.score += 40;
-      }
-
-      // Especially strong combination:
-      // "After more than 21 hours on the surface..."
-      if (
-        /\bafter\b/.test(s) &&
-        /\bhours?\b/.test(s) &&
-        /\bsurface\b/.test(s)
-      ) {
-        item.score += 80;
-      }
-
-      // ----------------------------------------
-      // Penalize activity durations.
-      // ----------------------------------------
-
-      if (/\ballotted\b/.test(s)) {
-        item.score -= 100;
-      }
-
-      if (/\bsample collection\b/.test(s)) {
-        item.score -= 100;
-      }
-
-      if (/\bdocumenting\b/.test(s)) {
-        item.score -= 80;
-      }
-
-      if (/\bhalfway\b/.test(s)) {
-        item.score -= 80;
-      }
-
-      if (/\bactivity\b/.test(s)) {
-        item.score -= 60;
-      }
-
-      // Later events are weaker evidence.
-      if (/\brejoined\b/.test(s)) {
-        item.score -= 15;
-      }
-
-      if (
-        /\breturned safely to earth\b/.test(s)
-      ) {
-        item.score -= 30;
-      }
-    }
-  }
-
-  // --------------------------------------------
-  // Location
-  // --------------------------------------------
-
-  if (/\bwhere\b/.test(q)) {
-    for (const item of sentences) {
-      const s =
-        item.passage.toLowerCase();
-
-      if (/\blanding in\b/.test(s)) {
-        item.score += 120;
-      }
-
-      if (/\blanded in\b/.test(s)) {
-        item.score += 120;
-      }
-
-      if (
-        /\bdescended to the surface\b/.test(s)
-      ) {
-        item.score += 80;
-      }
-
-      if (/\btouched down\b/.test(s)) {
-        item.score += 100;
-      }
-
-      if (
-        /\bsea of tranquility\b/.test(s)
-      ) {
-        item.score += 50;
-      }
-
-      // Not the actual landing.
-      if (
-        /\bsaw\b/.test(s) &&
-        /\blanding site\b/.test(s)
-      ) {
-        item.score -= 150;
-      }
-
-      if (/\bpassing views\b/.test(s)) {
-        item.score -= 100;
-      }
-    }
-  }
-
-  const best =
-    sentences
-      .filter(
-        item => item.score > 0
-      )
-      .sort(
-        (a, b) =>
-          b.score - a.score
-      )[0];
-
-  return best
-    ? {
-        block_index:
-          best.block_index,
-
-        passage:
-          best.passage
-      }
-    : null;
-}
-
-
-// ======================================================
-// Utility
+// UTILITY
 // ======================================================
 
 function sleep(ms) {
