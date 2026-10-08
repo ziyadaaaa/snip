@@ -1,14 +1,14 @@
-export default async function handler(req, res) {
-  // ======================================================
-  // CORS
-  // ======================================================
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 
-  res.setHeader("Access-Control-Allow-Origin", "*");
+const ALLOWED_ORIGIN = "*";
+
+export default async function handler(req, res) {
+  res.setHeader("Access-Control-Allow-Origin", ALLOWED_ORIGIN);
   res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type");
 
   if (req.method === "OPTIONS") {
-    return res.status(200).end();
+    return res.status(204).end();
   }
 
   if (req.method !== "POST") {
@@ -18,383 +18,309 @@ export default async function handler(req, res) {
   }
 
   try {
-    const { question, blocks } = req.body || {};
-
-    if (!question || typeof question !== "string") {
-      return res.status(400).json({
-        error: "Missing question"
-      });
-    }
-
-    if (!Array.isArray(blocks) || blocks.length === 0) {
-      return res.status(400).json({
-        error: "Missing blocks"
-      });
-    }
-
-    // ====================================================
-    // Clean page blocks
-    // ====================================================
-
-    const cleanedBlocks = blocks
-      .map((block, i) => ({
-        index: Number.isInteger(block?.index)
-          ? block.index
-          : i,
-
-        text: String(block?.text || "")
-          .replace(/\s+/g, " ")
-          .trim(),
-
-        kind: block?.kind || "text",
-
-        section: String(block?.section || "").trim()
-      }))
-      .filter(block => block.text.length > 0);
-
-    if (!cleanedBlocks.length) {
-      return res.status(400).json({
-        error: "No usable page content"
-      });
-    }
-
-    const apiKey = process.env.OPENAI_API_KEY;
-
-    if (!apiKey) {
-      console.error("OPENAI_API_KEY is missing");
-
+    if (!OPENAI_API_KEY) {
       return res.status(500).json({
-        error: "Server configuration error"
+        error: "Missing OPENAI_API_KEY"
       });
     }
 
-    // ====================================================
-    // Question analysis
-    // ====================================================
+    const question = String(req.body?.question || "").trim();
+    const blocks = Array.isArray(req.body?.blocks)
+      ? req.body.blocks
+      : [];
 
-    const questionInfo = analyzeQuestion(question);
+    if (!question) {
+      return res.status(400).json({
+        error: "Question is required"
+      });
+    }
 
-    // ====================================================
-    // Build ALL sentences
-    // ====================================================
+    if (!blocks.length) {
+      return res.status(400).json({
+        error: "No page content supplied"
+      });
+    }
 
-    const sentences = [];
+    const cleanBlocks = blocks
+      .map((block, index) => ({
+        index:
+          Number.isFinite(Number(block?.index))
+            ? Number(block.index)
+            : index,
 
-    for (const block of cleanedBlocks) {
-      const parts = splitIntoSentences(block.text);
+        id:
+          block?.id ||
+          `block-${index}`,
 
-      for (let i = 0; i < parts.length; i++) {
-        const sentence = parts[i].trim();
+        text:
+          String(block?.text || "")
+            .replace(/\s+/g, " ")
+            .trim(),
 
-        if (!sentence) continue;
+        section:
+          String(block?.section || "Page")
+            .replace(/\s+/g, " ")
+            .trim()
+      }))
+      .filter(block => block.text.length >= 15);
 
-        sentences.push({
-          id: sentences.length,
+    if (!cleanBlocks.length) {
+      return res.status(400).json({
+        error: "No usable page content supplied"
+      });
+    }
+
+    const info = analyzeQuestion(question);
+
+    /*
+     * --------------------------------------------------------
+     * Split the page into sentences.
+     * This gives the ranking system much more precision than
+     * treating an entire paragraph as one candidate.
+     * --------------------------------------------------------
+     */
+
+    const sentenceItems = [];
+
+    for (const block of cleanBlocks) {
+      const sentences = splitIntoSentences(block.text);
+
+      sentences.forEach((sentence, sentenceIndex) => {
+        const cleaned = sentence
+          .replace(/\s+/g, " ")
+          .trim();
+
+        if (!cleaned) return;
+
+        sentenceItems.push({
           block_index: block.index,
-          sentence,
+          block_id: block.id,
           section: block.section,
-          kind: block.kind,
-          sentence_index: i
+          sentence_index: sentenceIndex,
+          sentence: cleaned
         });
-      }
-    }
-
-    if (!sentences.length) {
-      return res.status(200).json({
-        evidence: []
       });
     }
 
-    // ====================================================
-    // Rank sentences locally
-    // ====================================================
+    /*
+     * --------------------------------------------------------
+     * Local ranking
+     * --------------------------------------------------------
+     */
 
-    const ranked = sentences
+    const ranked = sentenceItems
       .map(item => ({
         ...item,
-        score: scoreSentence(
-          item,
-          questionInfo
-        )
+        score: scoreSentence(item, info)
       }))
       .sort((a, b) => b.score - a.score);
 
-    // ====================================================
-    // Select candidates
-    // ====================================================
+    /*
+     * Give the model enough context to verify the answer.
+     *
+     * We do not simply send the first N characters of the page.
+     * We send the strongest locally-ranked candidates plus their
+     * neighboring sentences.
+     */
 
-    const selected = selectCandidates(
-      ranked,
-      sentences,
-      questionInfo
+    const candidateMap = new Map();
+
+    const topLocal = ranked.slice(0, 60);
+
+    for (const item of topLocal) {
+      const key =
+        `${item.block_index}:${item.sentence_index}`;
+
+      candidateMap.set(key, item);
+
+      /*
+       * Include nearby sentences from the same block.
+       * This helps questions where the answer is split over
+       * adjacent sentences.
+       */
+
+      const neighbors = sentenceItems.filter(candidate =>
+        candidate.block_index === item.block_index &&
+        Math.abs(
+          candidate.sentence_index - item.sentence_index
+        ) <= 1
+      );
+
+      for (const neighbor of neighbors) {
+        const neighborKey =
+          `${neighbor.block_index}:${neighbor.sentence_index}`;
+
+        candidateMap.set(neighborKey, neighbor);
+      }
+    }
+
+    let candidates = [...candidateMap.values()]
+      .sort((a, b) => {
+        if (a.block_index !== b.block_index) {
+          return a.block_index - b.block_index;
+        }
+
+        return a.sentence_index - b.sentence_index;
+      });
+
+    /*
+     * Keep the request comfortably below the payload limit.
+     */
+
+    const candidateTextParts = [];
+    let totalChars = 0;
+
+    for (const item of candidates) {
+      const line =
+        `[block ${item.block_index} | section: ${item.section}]\n${item.sentence}\n`;
+
+      if (totalChars + line.length > 30000) {
+        break;
+      }
+
+      candidateTextParts.push(line);
+      totalChars += line.length;
+    }
+
+    candidates = candidates.filter(item =>
+      candidateTextParts.some(part =>
+        part.includes(item.sentence)
+      )
     );
 
-    const candidateText = selected
-      .map((item, i) => {
-        const hints = [];
-
-        if (item.score >= 80) {
-          hints.push("STRONG-CANDIDATE");
-        }
-
-        if (
-          questionInfo.isDuration &&
-          hasDuration(item.sentence)
-        ) {
-          hints.push("HAS-DURATION");
-        }
-
-        if (
-          questionInfo.isLocation &&
-          hasLocationSignal(item.sentence)
-        ) {
-          hints.push("HAS-LOCATION");
-        }
-
-        if (
-          questionInfo.isWho &&
-          hasPersonSignal(item.sentence)
-        ) {
-          hints.push("HAS-PERSON");
-        }
-
-        if (
-          questionInfo.isWhen &&
-          hasDateSignal(item.sentence)
-        ) {
-          hints.push("HAS-DATE");
-        }
-
-        return [
-          `[${i}]`,
-          `block=${item.block_index}`,
-          `score=${item.score}`,
-          hints.length ? hints.join(" ") : "",
-          item.sentence
-        ]
-          .filter(Boolean)
-          .join(" ");
-      })
-      .join("\n\n");
-
-    // ====================================================
-    // Ask OpenAI to select exact evidence
-    // ====================================================
-
-    const prompt = `
-You are Snip, an exact-location webpage retrieval system.
-
-USER QUESTION:
-${question}
-
-Your job is NOT to summarize the webpage.
-
-Your job is to find the exact sentence or sentences on the supplied webpage that directly answer the user's question.
-
-IMPORTANT:
-The webpage may contain many related sentences.
-Do NOT choose a sentence just because it shares keywords with the question.
-
-Choose the sentence that actually answers the question.
-
-RULES:
-
-1. Prefer ONE sentence when one sentence directly answers the question.
-2. Use TWO sentences only when the answer genuinely requires both.
-3. Prefer the smallest possible evidence.
-4. Never invent information.
-5. Never answer from general knowledge.
-6. The passage MUST be copied exactly from the supplied webpage sentence.
-7. Do not rewrite the sentence.
-8. Do not combine unrelated sentences.
-9. Do not choose a sentence merely because it contains a date, name, number, or location.
-10. If the webpage does not contain the answer, return an empty evidence array.
-
-WHO:
-- Find the sentence that explicitly identifies the requested person or people.
-- Match the person to the specific action, role, event, or relationship asked about.
-- For questions like "Who stayed in lunar orbit?", prefer a sentence identifying the person who stayed/remained in orbit.
-- For questions like "Who was the first person to walk on the Moon?", prefer the sentence identifying the first person.
-- A sentence mentioning "astronauts", "the crew", or another generic group is NOT enough unless it directly answers the question.
-- Do not choose an unrelated technical sentence merely because it mentions astronauts or a person's name.
-- Prefer explicit relationships such as "Collins remained...", "Armstrong became...", "Captain Smith commanded...", etc.
-
-WHEN:
-- Find the date/time that specifically answers the event in the question.
-- Do not choose an earlier or later date simply because it is prominent.
-
-WHERE:
-- Find where the event actually occurred.
-- For a landing question, prefer the actual landing location.
-- Do not select a sentence saying someone later viewed, observed, photographed, or mapped the location.
-
-HOW LONG:
-- Find the duration of the specific event/stay/period asked about.
-- Distinguish total duration from durations of individual activities.
-- For a question asking how long people stayed somewhere, prefer explicit stay/surface/location duration.
-- Do not select "34 minutes" merely because it is a duration if the question asks about an entire mission or stay.
-
-HOW MANY:
-- Find the number that answers the specific quantity requested.
-- Do not choose another nearby number.
-
-WHY:
-- Find the sentence explaining the cause/reason.
-- Do not choose a sentence merely describing the event.
-
-WHAT:
-- Find the sentence that directly defines, identifies, or explains the thing being asked about.
-
-WHICH:
-- Find the sentence that identifies the requested item.
-
-The candidate list has been locally ranked before reaching you.
-Higher scores are useful signals, but you must still verify the actual meaning.
-
-Return JSON only:
-
-{
-  "evidence": [
-    {
-      "block_index": 123,
-      "passage": "exact sentence copied from the webpage"
-    }
-  ]
-}
-
-WEBPAGE CANDIDATES:
-
-${candidateText}
-`;
-
-    const response =
-      await callOpenAI(apiKey, prompt);
-
-    const parsed =
-      parseModelJSON(response);
-
-    if (
-      !parsed ||
-      !Array.isArray(parsed.evidence)
-    ) {
-      throw new Error(
-        "Invalid model response"
-      );
-    }
-
-    // ====================================================
-    // Validate model evidence
-    // ====================================================
-
-    const validEvidence = [];
-
-    for (const item of parsed.evidence.slice(0, 2)) {
-      if (!item) continue;
-
-      const blockIndex =
-        Number(item.block_index);
-
-      const passage =
-        String(item.passage || "").trim();
-
-      if (
-        !Number.isInteger(blockIndex) ||
-        !passage
-      ) {
-        continue;
-      }
-
-      const sourceBlock =
-        cleanedBlocks.find(
-          block => block.index === blockIndex
-        );
-
-      if (!sourceBlock) continue;
-
-      if (
-        containsEquivalentText(
-          sourceBlock.text,
-          passage
-        )
-      ) {
-        validEvidence.push({
-          block_index: blockIndex,
-          passage
-        });
-      }
-    }
-
-    // ====================================================
-    // Precision / semantic validation
-    // ====================================================
-
-    if (
-      validEvidence.length === 0 ||
-      needsPrecisionOverride(
-        validEvidence,
-        questionInfo
-      )
-    ) {
-      const fallback =
-        findBestDeterministicSentence(
-          question,
-          cleanedBlocks
-        );
-
-      if (fallback) {
-        return res.status(200).json({
-          evidence: [fallback]
-        });
-      }
-
+    if (!candidates.length) {
       return res.status(200).json({
         evidence: []
       });
     }
 
-    // ====================================================
-    // Remove duplicate evidence
-    // ====================================================
+    /*
+     * --------------------------------------------------------
+     * OpenAI verification
+     * --------------------------------------------------------
+     */
 
-    const uniqueEvidence = [];
+    let modelResult = null;
 
-    const seen = new Set();
-
-    for (const item of validEvidence) {
-      const key =
-        `${item.block_index}|${normalizeText(item.passage)}`;
-
-      if (seen.has(key)) continue;
-
-      seen.add(key);
-      uniqueEvidence.push(item);
+    try {
+      modelResult = await callOpenAI({
+        question,
+        info,
+        candidates
+      });
+    } catch (error) {
+      console.error(
+        "OpenAI verification failed:",
+        error?.message || error
+      );
     }
 
+    /*
+     * --------------------------------------------------------
+     * Convert model result into validated evidence.
+     * --------------------------------------------------------
+     */
+
+    let evidence = [];
+
+    if (modelResult) {
+      evidence = normalizeModelEvidence(
+        modelResult,
+        candidates,
+        cleanBlocks
+      );
+    }
+
+    /*
+     * If the model did not produce usable evidence, use our
+     * deterministic fallback.
+     */
+
+    if (!evidence.length) {
+      const best =
+        findBestDeterministicSentence(
+          ranked,
+          info
+        );
+
+      if (best) {
+        evidence = [{
+          block_index: best.block_index,
+          block_id: best.block_id,
+          passage: best.sentence,
+          section: best.section
+        }];
+      }
+    }
+
+    /*
+     * --------------------------------------------------------
+     * Final validation / precision override
+     * --------------------------------------------------------
+     */
+
+    if (evidence.length) {
+      evidence = dedupeEvidence(evidence);
+
+      /*
+       * For highly specific question types, if the model picked
+       * something obviously weak, replace it with the deterministic
+       * answer.
+       */
+
+      if (shouldUseDeterministicOverride(
+        evidence,
+        info
+      )) {
+        const best =
+          findBestDeterministicSentence(
+            ranked,
+            info
+          );
+
+        if (best) {
+          evidence = [{
+            block_index: best.block_index,
+            block_id: best.block_id,
+            passage: best.sentence,
+            section: best.section
+          }];
+        }
+      }
+    }
+
+    /*
+     * Final answer object.
+     */
+
     return res.status(200).json({
-      evidence: uniqueEvidence
+      evidence
     });
 
   } catch (error) {
     console.error(
-      "FUNCTION ERROR:",
-      error
+      "SNIP API ERROR:",
+      error?.stack || error
     );
 
     return res.status(500).json({
-      error: "Function failed"
+      error:
+        error?.message ||
+        "Internal server error"
     });
   }
 }
 
 
-// ======================================================
-// QUESTION ANALYSIS
-// ======================================================
+/* ============================================================
+   QUESTION ANALYSIS
+   ============================================================ */
 
 function analyzeQuestion(question) {
   const q =
     String(question || "")
       .toLowerCase()
+      .replace(/\s+/g, " ")
       .trim();
 
   return {
@@ -434,23 +360,24 @@ function analyzeQuestion(question) {
       /\bwhich\b/.test(q),
 
     isRelationship:
-  /\b(?:husband|wife|father|mother|son|daughter|brother|sister|partner|spouse)\b/.test(q),
-   
-    terms: extractQuestionTerms(q)
+      /\b(?:husband|wife|father|mother|son|daughter|brother|sister|partner|spouse)\b/.test(q),
+
+    terms:
+      extractQuestionTerms(q)
   };
 }
 
 
-// ======================================================
-// QUESTION TERMS
-// ======================================================
+/* ============================================================
+   QUESTION TERMS
+   ============================================================ */
 
-function extractQuestionTerms(q) {
+function extractQuestionTerms(question) {
   const stopWords = new Set([
+    "who",
     "what",
     "when",
     "where",
-    "who",
     "why",
     "which",
     "how",
@@ -462,8 +389,8 @@ function extractQuestionTerms(q) {
     "is",
     "are",
     "did",
-    "do",
     "does",
+    "do",
     "the",
     "a",
     "an",
@@ -471,108 +398,124 @@ function extractQuestionTerms(q) {
     "to",
     "in",
     "on",
-    "at",
     "for",
-    "and",
-    "or",
     "from",
     "with",
+    "and",
+    "or",
+    "by",
+    "during",
     "about",
-    "this",
     "that",
+    "this",
     "it",
-    "they",
-    "he",
-    "she",
+    "its",
     "their",
     "his",
     "her",
-    "people",
-    "person",
-    "event"
+    "they",
+    "them",
+    "he",
+    "she"
   ]);
 
-  return q
-    .replace(/[^\p{L}\p{N}\s'-]/gu, " ")
-    .split(/\s+/)
+  return question
+    .split(/\W+/)
     .map(word => word.trim())
-    .filter(
-      word =>
-        word.length >= 2 &&
-        !stopWords.has(word)
-    );
+    .filter(Boolean)
+    .filter(word => word.length >= 3)
+    .filter(word => !stopWords.has(word));
 }
 
 
-// ======================================================
-// LOCAL SENTENCE SCORING
-// ======================================================
+/* ============================================================
+   SENTENCE SPLITTER
+   ============================================================ */
 
-function scoreSentence(
-  item,
-  info
-) {
+function splitIntoSentences(text) {
+  return String(text || "")
+    .replace(/\s+/g, " ")
+    .split(
+      /(?<=[.!?])\s+(?=[A-Z0-9"“‘(])/g
+    )
+    .map(sentence => sentence.trim())
+    .filter(Boolean);
+}
+
+
+/* ============================================================
+   SENTENCE SCORING
+   ============================================================ */
+
+function scoreSentence(item, info) {
+  const sentence =
+    String(item.sentence || "");
+
   const s =
-    item.sentence.toLowerCase();
-
-  const section =
-    item.section.toLowerCase();
+    sentence.toLowerCase();
 
   let score = 0;
 
-  // ----------------------------------------------------
-  // Question term overlap
-  // ----------------------------------------------------
+  /*
+   * ----------------------------------------------------------
+   * Question term overlap
+   * ----------------------------------------------------------
+   */
 
   for (const term of info.terms) {
-    if (!term) continue;
-
-    if (containsWord(s, term)) {
+    if (s.includes(term)) {
       score += 12;
-    }
-
-    if (
-      term.length >= 6 &&
-      s.includes(term)
-    ) {
-      score += 5;
-    }
-
-    if (
-      section &&
-      containsWord(section, term)
-    ) {
-      score += 3;
     }
   }
 
-  // ----------------------------------------------------
-  // WHO
-  // ----------------------------------------------------
+  /*
+   * Exact phrase overlap gets more weight.
+   */
+
+  const questionWords =
+    info.terms.filter(word => word.length >= 4);
+
+  if (
+    questionWords.length >= 2 &&
+    questionWords.every(word => s.includes(word))
+  ) {
+    score += 35;
+  }
+
+
+  /*
+   * ----------------------------------------------------------
+   * WHO
+   * ----------------------------------------------------------
+   */
 
   if (info.isWho) {
     const hasPerson =
-      hasPersonSignal(item.sentence);
+      hasPersonSignal(sentence);
 
     const genericPeople =
       /\b(?:the\s+)?(?:astronauts?|crew|people|scientists?|researchers?|soldiers?|members?|officials?)\b/i
-        .test(item.sentence);
+        .test(sentence);
 
     const explicitIdentity =
-      /\b(?:was|were|became|remained|stayed|served|led|commanded|piloted|flew|walked|landed|discovered|invented|married|husband|wife|brother|sister)\b/i
-        .test(item.sentence);
+      /\b(?:was|were|became|remained|stayed|served|led|commanded|piloted|flew|walked|landed|discovered|invented|married|husband|wife|brother|sister|father|mother|son|daughter|partner|spouse)\b/i
+        .test(sentence);
 
-    // Extremely strong pattern for:
-    // "Who stayed in lunar orbit?"
-    // "Who remained in lunar orbit?"
+    /*
+     * Special high-confidence lunar-orbit question.
+     */
+
     if (
-      /\b(?:stayed|remained)\b/i.test(item.sentence) &&
-      /\b(?:lunar orbit|orbit)\b/i.test(item.sentence)
+      /\b(?:stayed|remained)\b/i.test(sentence) &&
+      /\b(?:lunar orbit|orbit)\b/i.test(sentence)
     ) {
       score += 180;
     }
 
-    // Person + meaningful action/relationship.
+    /*
+     * Strong person identity.
+     */
+
     if (
       hasPerson &&
       explicitIdentity
@@ -588,7 +531,11 @@ function scoreSentence(
       score += 30;
     }
 
-    // Generic group references are weak.
+    /*
+     * Generic "astronauts", "crew", etc. should not beat a
+     * sentence that actually identifies the person.
+     */
+
     if (
       genericPeople &&
       !hasPerson
@@ -596,8 +543,6 @@ function scoreSentence(
       score -= 100;
     }
 
-    // Technical sentences that only mention
-    // astronauts/crew should be strongly penalized.
     if (
       genericPeople &&
       !explicitIdentity &&
@@ -606,685 +551,240 @@ function scoreSentence(
       score -= 80;
     }
 
-    // A sentence that only says someone "said" something
-    // is weaker unless the question is explicitly about who said it.
-    if (
-      /\baccording to\b|\bsaid\b|\breported\b/.test(s) &&
-      !explicitIdentity
-    ) {
-      score -= 10;
+    /*
+     * --------------------------------------------------------
+     * Relationship questions
+     *
+     * Example:
+     * "Who was Marie Curie's husband?"
+     *
+     * Prefer a sentence that establishes the relationship.
+     * Penalize incidental mentions such as:
+     * "with her husband Pierre Curie..."
+     * --------------------------------------------------------
+     */
+
+    if (info.isRelationship) {
+      const relationshipMatch =
+        /\b(?:husband|wife|father|mother|son|daughter|brother|sister|partner|spouse)\b/i
+          .test(sentence);
+
+      const strongRelationship =
+        /\b(?:married|husband|wife|father|mother|son|daughter|brother|sister|partner|spouse)\b/i
+          .test(sentence);
+
+      if (strongRelationship) {
+        score += 80;
+      }
+
+      if (
+        /\b(?:married|husband|wife|spouse)\b/i.test(sentence)
+      ) {
+        score += 100;
+      }
+
+      /*
+       * "with her husband X" is often a passing reference.
+       */
+
+      if (
+        /\bwith (?:her|his|their) (?:husband|wife|spouse)\b/i.test(sentence)
+      ) {
+        score -= 100;
+      }
+
+      /*
+       * Parenthetical citation-style mentions are weaker.
+       */
+
+      if (
+        relationshipMatch &&
+        /[\(\[]/.test(sentence)
+      ) {
+        score -= 80;
+      }
     }
   }
 
-  // ----------------------------------------------------
-  // WHEN
-  // ----------------------------------------------------
+
+  /*
+   * ----------------------------------------------------------
+   * WHEN
+   * ----------------------------------------------------------
+   */
 
   if (info.isWhen) {
-    if (hasDateSignal(item.sentence)) {
-      score += 55;
-    }
-
     if (
-      /\bstarted\b|\bbegan\b|\bended\b|\bended on\b|\blaunched\b|\bsank\b|\bdied\b|\barrived\b|\boccurred\b|\btook place\b/.test(s)
+      /\b(?:19|20)\d{2}\b/.test(sentence) ||
+      /\b(?:january|february|march|april|may|june|july|august|september|october|november|december)\b/i.test(sentence) ||
+      /\b(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b/i.test(sentence) ||
+      /\b\d{1,2}:\d{2}\b/.test(sentence) ||
+      /\b(?:utc|gmt|est|edt|pst|pdt)\b/i.test(sentence)
     ) {
-      score += 35;
-    }
-  }
-
-  // ----------------------------------------------------
-  // WHERE
-  // ----------------------------------------------------
-
-  if (info.isWhere) {
-    if (hasLocationSignal(item.sentence)) {
-      score += 45;
+      score += 100;
     }
 
     if (
-      /\blanded\b|\blanding\b|\btouched down\b|\barrived\b|\bdescended\b|\breached\b|\boccurred\b|\btook place\b/.test(s)
-    ) {
-      score += 45;
-    }
-
-    if (
-      /\bsaw\b.*\blanding site\b/.test(s) ||
-      /\bpassing views\b/.test(s)
-    ) {
-      score -= 90;
-    }
-  }
-
-  // ----------------------------------------------------
-  // HOW LONG
-  // ----------------------------------------------------
-
-  if (info.isDuration) {
-    if (hasDuration(item.sentence)) {
-      score += 70;
-    }
-
-    if (
-      /\bafter\b.*\bhours?\b.*\bsurface\b/.test(s)
-    ) {
-      score += 70;
-    }
-
-    if (
-      /\bon the (?:lunar )?surface\b/.test(s)
-    ) {
-      score += 55;
-    }
-
-    if (
-      /\bon the moon\b/.test(s)
-    ) {
-      score += 55;
-    }
-
-    if (
-      /\ballotted\b|\ballocated\b|\bsample collection\b|\bdocumenting\b|\bhalfway\b|\bactivity\b|\bexperiment\b/.test(s)
-    ) {
-      score -= 110;
-    }
-  }
-
-  // ----------------------------------------------------
-  // HOW MANY
-  // ----------------------------------------------------
-
-  if (info.isHowMany) {
-    if (
-      /\b\d+(?:\.\d+)?\b/.test(s) ||
-      /\b(?:one|two|three|four|five|six|seven|eight|nine|ten|hundred|thousand|million)\b/.test(s)
+      /\b(?:launched|launch|began|started|ended|occurred|happened|landed|arrived|departed|died|born)\b/i.test(sentence)
     ) {
       score += 50;
     }
   }
 
-  // ----------------------------------------------------
-  // WHY
-  // ----------------------------------------------------
 
-  if (info.isWhy) {
+  /*
+   * ----------------------------------------------------------
+   * WHERE
+   * ----------------------------------------------------------
+   */
+
+  if (info.isWhere) {
     if (
-      /\bbecause\b|\bdue to\b|\bso that\b|\bin order to\b|\bcaused by\b|\bresulted from\b|\breason\b|\bwhy\b/.test(s)
+      /\b(?:in|at|on|near|inside|outside|aboard|from|into|onto)\b/i.test(sentence)
+    ) {
+      score += 25;
+    }
+
+    if (
+      /\b(?:located|landed|launched|arrived|departed|traveled|travelled|based|situated|occurred)\b/i.test(sentence)
     ) {
       score += 70;
     }
 
+    /*
+     * Capitalized place-name patterns.
+     */
+
     if (
-      /\btherefore\b|\bconsequently\b|\bas a result\b/.test(s)
+      /\b(?:Moon|Earth|Mars|Atlantic|Pacific|London|Paris|New York|Washington|Dubai|Addis Ababa)\b/.test(sentence)
     ) {
       score += 30;
     }
   }
 
-  // ----------------------------------------------------
-  // WHAT
-  // ----------------------------------------------------
+
+  /*
+   * ----------------------------------------------------------
+   * DURATION
+   * ----------------------------------------------------------
+   */
+
+  if (info.isDuration) {
+    if (
+      /\b\d+(?:\.\d+)?\s*(?:hours?|minutes?|days?|weeks?|months?|years?)\b/i.test(sentence)
+    ) {
+      score += 150;
+    }
+
+    if (
+      /\b(?:more than|less than|approximately|about|nearly|roughly)\s+\d+/i.test(sentence)
+    ) {
+      score += 40;
+    }
+
+    if (
+      /\b(?:lasted|duration|spent|remained|stayed|on the surface|aboard)\b/i.test(sentence)
+    ) {
+      score += 60;
+    }
+  }
+
+
+  /*
+   * ----------------------------------------------------------
+   * HOW MANY / HOW MUCH
+   * ----------------------------------------------------------
+   */
+
+  if (info.isHowMany) {
+    if (
+      /\b\d+(?:\.\d+)?\b/.test(sentence)
+    ) {
+      score += 80;
+    }
+
+    if (
+      /\b(?:million|billion|thousand|hundred|percent|%)\b/i.test(sentence)
+    ) {
+      score += 60;
+    }
+  }
+
+
+  /*
+   * ----------------------------------------------------------
+   * WHY
+   * ----------------------------------------------------------
+   */
+
+  if (info.isWhy) {
+    if (
+      /\b(?:because|due to|since|as a result|reason|caused|cause|in order to|so that)\b/i.test(sentence)
+    ) {
+      score += 100;
+    }
+  }
+
+
+  /*
+   * ----------------------------------------------------------
+   * WHAT
+   * ----------------------------------------------------------
+   */
 
   if (info.isWhat) {
     if (
-      /\bis a\b|\bis an\b|\bwas a\b|\bwas an\b|\brefers to\b|\bmeans\b|\bdefined as\b|\bknown as\b/.test(s)
+      /\b(?:is|was|means|refers to|defined as|known as|called)\b/i.test(sentence)
+    ) {
+      score += 50;
+    }
+  }
+
+
+  /*
+   * ----------------------------------------------------------
+   * WHICH
+   * ----------------------------------------------------------
+   */
+
+  if (info.isWhich) {
+    if (
+      info.terms.some(term =>
+        s.includes(term)
+      )
     ) {
       score += 35;
     }
   }
 
-  // ----------------------------------------------------
-  // WHICH
-  // ----------------------------------------------------
 
-  if (info.isWhich) {
-    score += 15;
-
-    if (
-      /\bwas\b|\bwere\b|\bis\b|\bare\b|\bchosen\b|\bselected\b|\bused\b/.test(s)
-    ) {
-      score += 20;
-    }
-  }
-
-  // ----------------------------------------------------
-  // Strong exact-answer patterns
-  // ----------------------------------------------------
+  /*
+   * Penalize navigation / metadata / citation junk.
+   */
 
   if (
-    /\bthe first\b|\bthe only\b|\bthe main\b|\bthe cause\b|\bthe reason\b/.test(s)
+    /\b(?:copyright|privacy policy|terms of service|cookie policy|sign in|subscribe|menu|navigation)\b/i.test(sentence)
   ) {
-    score += 8;
-  }
-
-  // ----------------------------------------------------
-  // Penalize navigation / metadata / weak sentences
-  // ----------------------------------------------------
-
-  if (
-    /\bcookie\b|\bprivacy policy\b|\bsubscribe\b|\bsign up\b|\blog in\b|\badvertisement\b/.test(s)
-  ) {
-    score -= 80;
+    score -= 100;
   }
 
   if (
-    item.kind === "h1" ||
-    item.kind === "h2" ||
-    item.kind === "h3"
+    /^\s*[\[\(]?\d+[\]\)]?\s*$/.test(sentence)
   ) {
-    score += 3;
+    score -= 100;
   }
 
   return score;
 }
 
 
-// ======================================================
-// CANDIDATE SELECTION
-// ======================================================
-
-function selectCandidates(
-  ranked,
-  allSentences,
-  info
-) {
-  const selected = [];
-  const selectedIds = new Set();
-
-  // Take the strongest direct candidates.
-  for (const item of ranked.slice(0, 30)) {
-    if (item.score <= 0) continue;
-
-    addCandidateWithNeighbors(
-      item,
-      allSentences,
-      selected,
-      selectedIds
-    );
-
-    if (selected.length >= 90) {
-      break;
-    }
-  }
-
-  // If local ranking is weak, still give GPT some page content.
-  if (selected.length < 12) {
-    for (const item of ranked.slice(0, 20)) {
-      addCandidateWithNeighbors(
-        item,
-        allSentences,
-        selected,
-        selectedIds
-      );
-
-      if (selected.length >= 60) {
-        break;
-      }
-    }
-  }
-
-  // Keep deterministic ordering by original page position.
-  return selected
-    .sort((a, b) => a.id - b.id)
-    .slice(0, 100);
-}
-
-
-function addCandidateWithNeighbors(
-  item,
-  allSentences,
-  selected,
-  selectedIds
-) {
-  const position =
-    allSentences.findIndex(
-      candidate =>
-        candidate.id === item.id
-    );
-
-  if (position === -1) return;
-
-  const start =
-    Math.max(0, position - 1);
-
-  const end =
-    Math.min(
-      allSentences.length - 1,
-      position + 1
-    );
-
-  for (
-    let i = start;
-    i <= end;
-    i++
-  ) {
-    const candidate =
-      allSentences[i];
-
-    if (selectedIds.has(candidate.id)) {
-      continue;
-    }
-
-    selectedIds.add(candidate.id);
-
-    selected.push({
-      ...candidate,
-
-      score:
-        candidate.id === item.id
-          ? item.score
-          : scoreNeighbor(candidate)
-    });
-  }
-}
-
-
-function scoreNeighbor(item) {
-  return 1;
-}
-
-
-// ======================================================
-// DETERMINISTIC PRECISION CHECK
-// ======================================================
-
-function needsPrecisionOverride(
-  evidence,
-  info
-) {
-  if (!evidence.length) {
-    return true;
-  }
-
-  const passage =
-    evidence[0].passage.toLowerCase();
-
-  // ----------------------------------------------------
-  // Duration
-  // ----------------------------------------------------
-
-  if (info.isDuration) {
-    if (!hasDuration(passage)) {
-      return true;
-    }
-
-    if (
-      /\ballotted\b|\ballocated\b|\bactivity\b|\bsample collection\b|\bdocumenting\b|\bhalfway\b|\bexperiment\b/.test(passage)
-    ) {
-      return true;
-    }
-
-    if (
-      /\bmoon\b|\blunar\b|\bsurface\b/.test(info.raw)
-    ) {
-      if (
-        !/\bsurface\b|\bmoon\b|\blunar stay\b/.test(passage)
-      ) {
-        return true;
-      }
-    }
-  }
-
-  // ----------------------------------------------------
-  // Location
-  // ----------------------------------------------------
-
-  if (info.isWhere) {
-    if (
-      /\bsaw\b.*\blanding site\b/.test(passage) ||
-      /\bpassing views\b/.test(passage)
-    ) {
-      return true;
-    }
-  }
-
-  // ----------------------------------------------------
-  // When
-  // ----------------------------------------------------
-
-  if (info.isWhen) {
-    if (!hasDateSignal(passage)) {
-      return true;
-    }
-  }
-
-  // ----------------------------------------------------
-  // Who
-  // ----------------------------------------------------
-
-  if (info.isWho) {
-    if (!hasPersonSignal(evidence[0].passage)) {
-      return true;
-    }
-
-    const genericPeople =
-      /\b(?:the\s+)?(?:astronauts?|crew|people|scientists?|researchers?|soldiers?|members?|officials?)\b/i
-        .test(evidence[0].passage);
-
-    const explicitIdentity =
-      /\b(?:was|were|became|remained|stayed|served|led|commanded|piloted|flew|walked|landed|discovered|invented|married|husband|wife|brother|sister)\b/i
-        .test(evidence[0].passage);
-
-    // A generic crew sentence is not enough.
-    if (
-      genericPeople &&
-      !explicitIdentity
-    ) {
-      return true;
-    }
-
-    // Specific lunar-orbit questions need an actual
-    // orbit relationship, not merely a person's name.
-    if (
-      /\b(?:lunar orbit|orbit)\b/i.test(info.raw) &&
-      /\b(?:stayed|remained)\b/i.test(info.raw)
-    ) {
-      if (
-        !(
-          /\b(?:stayed|remained)\b/i.test(evidence[0].passage) &&
-          /\b(?:lunar orbit|orbit)\b/i.test(evidence[0].passage)
-        )
-      ) {
-        return true;
-      }
-    }
-  }
-
-  return false;
-}
-
-
-// ======================================================
-// DETERMINISTIC FALLBACK
-// ======================================================
-
-function findBestDeterministicSentence(
-  question,
-  blocks
-) {
-  const info =
-    analyzeQuestion(question);
-
-  const sentences = [];
-
-  for (const block of blocks) {
-    for (
-      const sentence of
-      splitIntoSentences(block.text)
-    ) {
-      const clean =
-        sentence.trim();
-
-      if (!clean) continue;
-
-      sentences.push({
-        block_index: block.index,
-        passage: clean,
-        score: scoreSentence(
-          {
-            sentence: clean,
-            section: block.section || "",
-            kind: block.kind || "text"
-          },
-          info
-        )
-      });
-    }
-  }
-
-  if (!sentences.length) {
-    return null;
-  }
-
-  // Additional deterministic intent-specific scoring.
-  for (const item of sentences) {
-    // IMPORTANT:
-    // Keep the original passage for person detection.
-    // Do not pass the lowercased version to hasPersonSignal().
-    const original =
-      item.passage;
-
-    const s =
-      original.toLowerCase();
-
-    // --------------------------------------------------
-    // Duration
-    // --------------------------------------------------
-
-    if (info.isDuration) {
-      if (hasDuration(s)) {
-        item.score += 100;
-      }
-
-      if (
-        /\bon the (?:lunar )?surface\b/.test(s) ||
-        /\bon the moon\b/.test(s)
-      ) {
-        item.score += 90;
-      }
-
-      if (
-        /\bafter\b.*\bhours?\b.*\bsurface\b/.test(s)
-      ) {
-        item.score += 100;
-      }
-
-      if (
-        /\ballotted\b|\ballocated\b|\bsample collection\b|\bdocumenting\b|\bhalfway\b|\bactivity\b|\bexperiment\b/.test(s)
-      ) {
-        item.score -= 200;
-      }
-    }
-
-    // --------------------------------------------------
-    // Location
-    // --------------------------------------------------
-
-    if (info.isWhere) {
-      if (
-        /\blanding in\b|\blanded in\b|\btouched down\b/.test(s)
-      ) {
-        item.score += 160;
-      }
-
-      if (
-        /\bdescended to the surface\b/.test(s)
-      ) {
-        item.score += 100;
-      }
-
-      if (
-        /\bsaw\b.*\blanding site\b/.test(s) ||
-        /\bpassing views\b/.test(s)
-      ) {
-        item.score -= 200;
-      }
-    }
-
-    // --------------------------------------------------
-    // WHO
-    // --------------------------------------------------
-
-    if (info.isWho) {
-      const hasPerson =
-        hasPersonSignal(original);
-
-      const genericPeople =
-        /\b(?:the\s+)?(?:astronauts?|crew|people|scientists?|researchers?|soldiers?|members?|officials?)\b/i
-          .test(original);
-
-      const explicitIdentity =
-        /\b(?:was|were|became|remained|stayed|served|led|commanded|piloted|flew|walked|landed|discovered|invented|married|husband|wife|brother|sister)\b/i
-          .test(original);
-
-      // Strong person evidence.
-      if (hasPerson) {
-        item.score += 100;
-      }
-
-      // Strong action / relationship evidence.
-      if (explicitIdentity) {
-        item.score += 70;
-      }
-
-      // Exact orbital question pattern.
-      if (
-        /\b(?:stayed|remained)\b/i.test(original) &&
-        /\b(?:lunar orbit|orbit)\b/i.test(original)
-      ) {
-        item.score += 180;
-      }
-
-      // Strong pattern:
-      // "Collins remained in lunar orbit..."
-      if (
-        /\b[A-Z][a-z'-]{2,}\s+(?:stayed|remained)\b/i.test(original) &&
-        /\b(?:lunar orbit|orbit)\b/i.test(original)
-      ) {
-        item.score += 100;
-      }
-
-      // First-person achievement patterns.
-      if (
-        /\bwas the first\b|\bbecame the first\b/.test(s)
-      ) {
-        item.score += 100;
-      }
-
-      // Generic references without identification are weak.
-      if (
-        genericPeople &&
-        !hasPerson
-      ) {
-        item.score -= 140;
-      }
-
-      // Generic crew sentences with no identity/action.
-      if (
-        genericPeople &&
-        !explicitIdentity &&
-        !hasPerson
-      ) {
-        item.score -= 100;
-      }
-    }
-
-    // --------------------------------------------------
-    // When
-    // --------------------------------------------------
-
-    if (info.isWhen) {
-      if (hasDateSignal(s)) {
-        item.score += 100;
-      }
-
-      if (
-        /\bstarted\b|\bbegan\b|\blaunched\b|\bsank\b|\bended\b|\bended on\b|\barrived\b|\boccurred\b|\btook place\b/.test(s)
-      ) {
-        item.score += 60;
-      }
-    }
-
-    // --------------------------------------------------
-    // Why
-    // --------------------------------------------------
-
-    if (info.isWhy) {
-      if (
-        /\bbecause\b|\bdue to\b|\bcaused by\b|\bresulted from\b|\breason\b/.test(s)
-      ) {
-        item.score += 100;
-      }
-    }
-  }
-
-  const sorted =
-    sentences
-      .filter(item => item.score > 0)
-      .sort(
-        (a, b) =>
-          b.score - a.score
-      );
-
-  if (!sorted.length) {
-    return null;
-  }
-
-  // Don't return an obviously invalid answer.
-  for (const item of sorted) {
-    if (
-      !needsPrecisionOverride(
-        [item],
-        info
-      )
-    ) {
-      return {
-        block_index:
-          item.block_index,
-
-        passage:
-          item.passage
-      };
-    }
-  }
-
-  return null;
-}
-
-
-// ======================================================
-// SIGNAL HELPERS
-// ======================================================
-
-function hasDuration(text) {
-  return /\b(?:more than|less than|about|approximately|around|nearly|roughly)?\s*\d+(?:\.\d+)?\s*(?:hours?|hrs?|minutes?|mins?|days?|weeks?|months?|years?)\b/i
-    .test(String(text || ""));
-}
-
-
-function hasDateSignal(text) {
-  const s =
-    String(text || "");
-
-  return (
-    /\b\d{1,2}\s+(?:January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{4}\b/i.test(s) ||
-
-    /\b(?:January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{1,2}(?:,\s*\d{4})?\b/i.test(s) ||
-
-    /\b(?:19|20)\d{2}\b/.test(s) ||
-
-    /\b\d{1,2}:\d{2}\s*(?:UTC|GMT|AM|PM)?\b/i.test(s)
-  );
-}
-
-
-function hasLocationSignal(text) {
-  const s =
-    String(text || "").toLowerCase();
-
-  return (
-    /\blanded\b/.test(s) ||
-    /\blanding\b/.test(s) ||
-    /\btouched down\b/.test(s) ||
-    /\bdescended\b/.test(s) ||
-    /\barrived\b/.test(s) ||
-    /\breached\b/.test(s) ||
-    /\bin the\b/.test(s) ||
-    /\bat the\b/.test(s)
-  );
-}
-
-
-// ======================================================
-// PERSON DETECTION
-// ======================================================
+/* ============================================================
+   PERSON SIGNAL
+   ============================================================ */
 
 function hasPersonSignal(text) {
   const s =
     String(text || "");
-
-  // ----------------------------------------------------
-  // Explicit titles + names
-  // ----------------------------------------------------
 
   if (
     /\b(?:Mr\.|Mrs\.|Ms\.|Dr\.|Prof\.|Professor|Captain|Commander|Colonel|General|President)\s+[A-Z][A-Za-z'-]+(?:\s+[A-Z][A-Za-z'-]+){0,3}\b/
@@ -1293,29 +793,11 @@ function hasPersonSignal(text) {
     return true;
   }
 
-  // ----------------------------------------------------
-  // Two-word proper names
-  //
-  // Examples:
-  // Neil Armstrong
-  // Marie Curie
-  // Edward Smith
-  // ----------------------------------------------------
-
   if (
     /\b[A-Z][a-z'-]+\s+[A-Z][a-z'-]+\b/.test(s)
   ) {
     return true;
   }
-
-  // ----------------------------------------------------
-  // Single surname/name directly performing an action
-  //
-  // Examples:
-  // Collins remained...
-  // Armstrong walked...
-  // Curie discovered...
-  // ----------------------------------------------------
 
   if (
     /\b[A-Z][a-z'-]{2,}\s+(?:was|were|became|remained|stayed|served|led|commanded|piloted|flew|walked|landed|discovered|invented|married)\b/
@@ -1328,209 +810,503 @@ function hasPersonSignal(text) {
 }
 
 
-function containsWord(text, word) {
-  if (!word) return false;
+/* ============================================================
+   DETERMINISTIC FALLBACK
+   ============================================================ */
 
-  const escaped =
-    word.replace(
-      /[.*+?^${}()|[\]\\]/g,
-      "\\$&"
-    );
+function findBestDeterministicSentence(
+  ranked,
+  info
+) {
+  if (!ranked.length) {
+    return null;
+  }
 
-  return new RegExp(
-    `\\b${escaped}\\b`,
-    "i"
-  ).test(text);
+  const scored =
+    ranked.map(item => ({
+      ...item,
+      score: item.score
+    }));
+
+  /*
+   * ----------------------------------------------------------
+   * WHO
+   * ----------------------------------------------------------
+   */
+
+  if (info.isWho) {
+    for (const item of scored) {
+      const original =
+        String(item.sentence || "");
+
+      const s =
+        original.toLowerCase();
+
+      const hasPerson =
+        hasPersonSignal(original);
+
+      const genericPeople =
+        /\b(?:the\s+)?(?:astronauts?|crew|people|scientists?|researchers?|soldiers?|members?|officials?)\b/i
+          .test(original);
+
+      const explicitIdentity =
+        /\b(?:was|were|became|remained|stayed|served|led|commanded|piloted|flew|walked|landed|discovered|invented|married|husband|wife|brother|sister|father|mother|son|daughter|partner|spouse)\b/i
+          .test(original);
+
+      if (hasPerson) {
+        item.score += 100;
+      }
+
+      if (explicitIdentity) {
+        item.score += 70;
+      }
+
+      /*
+       * Specific lunar-orbit pattern.
+       */
+
+      if (
+        /\b(?:stayed|remained)\b/i.test(original) &&
+        /\b(?:lunar orbit|orbit)\b/i.test(original)
+      ) {
+        item.score += 180;
+      }
+
+      if (
+        /\b[A-Z][a-z'-]{2,}\s+(?:stayed|remained)\b/i.test(original) &&
+        /\b(?:lunar orbit|orbit)\b/i.test(original)
+      ) {
+        item.score += 100;
+      }
+
+      /*
+       * First-person/first-person-to-do-something pattern.
+       */
+
+      if (
+        /\bwas the first\b|\bbecame the first\b/.test(s)
+      ) {
+        item.score += 100;
+      }
+
+      /*
+       * Generic people without identity signal are weak.
+       */
+
+      if (
+        genericPeople &&
+        !hasPerson
+      ) {
+        item.score -= 140;
+      }
+
+      if (
+        genericPeople &&
+        !explicitIdentity &&
+        !hasPerson
+      ) {
+        item.score -= 100;
+      }
+
+      /*
+       * ------------------------------------------------------
+       * Relationship questions
+       * ------------------------------------------------------
+       */
+
+      if (
+        info.isRelationship
+      ) {
+        /*
+         * A sentence explicitly saying "married" is very strong.
+         */
+
+        if (
+          /\b(?:married|husband|wife|spouse)\b/i.test(original)
+        ) {
+          item.score += 120;
+        }
+
+        if (
+          /\b(?:father|mother|son|daughter|brother|sister|partner)\b/i.test(original)
+        ) {
+          item.score += 100;
+        }
+
+        /*
+         * Strong preference for an explicit marriage statement.
+         */
+
+        if (
+          /\b(?:married|married to|husband|wife|spouse)\b/i.test(original)
+        ) {
+          item.score += 80;
+        }
+
+        /*
+         * Penalize incidental phrases like:
+         * "with her husband Pierre Curie..."
+         */
+
+        if (
+          /\bwith (?:her|his|their) (?:husband|wife|spouse)\b/i.test(original)
+        ) {
+          item.score -= 120;
+        }
+
+        /*
+         * Citation / parenthetical references are less reliable.
+         */
+
+        if (
+          /[\(\[]/.test(original) &&
+          /\b(?:husband|wife|spouse)\b/i.test(original)
+        ) {
+          item.score -= 80;
+        }
+      }
+    }
+  }
+
+
+  /*
+   * ----------------------------------------------------------
+   * WHEN
+   * ----------------------------------------------------------
+   */
+
+  if (info.isWhen) {
+    for (const item of scored) {
+      const s =
+        item.sentence.toLowerCase();
+
+      if (
+        /\b(?:19|20)\d{2}\b/.test(item.sentence) ||
+        /\b(?:january|february|march|april|may|june|july|august|september|october|november|december)\b/i.test(item.sentence) ||
+        /\b\d{1,2}:\d{2}\b/.test(item.sentence)
+      ) {
+        item.score += 100;
+      }
+
+      if (
+        /\b(?:launch|launched|landed|began|started|ended|occurred|born|died)\b/i.test(s)
+      ) {
+        item.score += 60;
+      }
+    }
+  }
+
+
+  /*
+   * ----------------------------------------------------------
+   * WHERE
+   * ----------------------------------------------------------
+   */
+
+  if (info.isWhere) {
+    for (const item of scored) {
+      const s =
+        item.sentence.toLowerCase();
+
+      if (
+        /\b(?:landed|located|situated|occurred|arrived|departed|traveled|travelled|based)\b/i.test(s)
+      ) {
+        item.score += 100;
+      }
+
+      if (
+        /\b(?:in|at|on|near|inside|outside|aboard)\b/i.test(s)
+      ) {
+        item.score += 20;
+      }
+    }
+  }
+
+
+  /*
+   * ----------------------------------------------------------
+   * DURATION
+   * ----------------------------------------------------------
+   */
+
+  if (info.isDuration) {
+    for (const item of scored) {
+      const s =
+        item.sentence.toLowerCase();
+
+      if (
+        /\b\d+(?:\.\d+)?\s*(?:hours?|minutes?|days?|weeks?|months?|years?)\b/i.test(s)
+      ) {
+        item.score += 160;
+      }
+
+      if (
+        /\b(?:more than|less than|approximately|about|nearly|roughly)\s+\d+/i.test(s)
+      ) {
+        item.score += 40;
+      }
+
+      if (
+        /\b(?:lasted|duration|spent|remained|stayed)\b/i.test(s)
+      ) {
+        item.score += 60;
+      }
+    }
+  }
+
+
+  /*
+   * ----------------------------------------------------------
+   * HOW MANY
+   * ----------------------------------------------------------
+   */
+
+  if (info.isHowMany) {
+    for (const item of scored) {
+      if (
+        /\b\d+(?:\.\d+)?\b/.test(item.sentence)
+      ) {
+        item.score += 80;
+      }
+    }
+  }
+
+
+  scored.sort((a, b) =>
+    b.score - a.score
+  );
+
+  return scored[0] || null;
 }
 
 
-// ======================================================
-// OPENAI RESPONSES API
-// ======================================================
+/* ============================================================
+   OPENAI CALL
+   ============================================================ */
 
-async function callOpenAI(
-  apiKey,
-  prompt
-) {
-  const body = {
-    model: "gpt-5-mini",
+async function callOpenAI({
+  question,
+  info,
+  candidates
+}) {
+  const candidateText =
+    candidates
+      .map((item, index) =>
+        `CANDIDATE ${index + 1}
+Block: ${item.block_index}
+Section: ${item.section}
+Text: ${item.sentence}`
+      )
+      .join("\n\n");
 
-    store: false,
+  const systemPrompt = `
+You are the answer-location engine for Snip.
 
-    input: [
+Snip does NOT want a general answer from you.
+
+Your job is to identify the exact passage on the supplied webpage that answers the user's question.
+
+Return only evidence from the supplied page.
+
+Rules:
+
+1. Never invent information.
+2. Never answer from outside knowledge.
+3. Select the smallest passage that directly answers the question.
+4. Prefer a sentence that explicitly establishes the answer.
+5. Do not select navigation, menus, unrelated metadata, or citation fragments.
+6. The passage must actually support the question.
+7. If several passages support the answer, return the strongest relevant passages.
+8. The user will be taken directly to the selected passage, so accuracy is more important than explanation.
+9. Preserve the original wording exactly.
+
+WHO:
+- Find the sentence that explicitly identifies the requested person or people.
+- If the question asks for a relationship such as husband, wife, father, mother, son, daughter, brother, sister, partner, or spouse, the selected sentence must actually establish that relationship.
+- Do NOT select a sentence that merely mentions the relationship in passing.
+- For example, for "Who was Marie Curie's husband?", a sentence like "Marie Curie married Pierre Curie in 1895" is preferred over a sentence like "Nobel Prize in Physics (1903, with her husband Pierre Curie and Henri Becquerel)."
+
+WHEN:
+- Find the sentence containing the relevant date or time.
+- Prefer explicit dates over vague references.
+
+WHERE:
+- Find the sentence explicitly identifying the location.
+
+HOW LONG:
+- Find the sentence containing the relevant duration.
+- Prefer explicit numerical durations.
+
+HOW MANY / HOW MUCH:
+- Find the sentence containing the relevant quantity.
+
+WHY:
+- Find the sentence explaining the reason or cause.
+
+WHAT:
+- Find the sentence that directly defines or explains the requested thing.
+
+If no candidate answers the question, return an empty evidence array.
+`;
+
+  const userPrompt = `
+Question:
+${question}
+
+Question type:
+${JSON.stringify({
+  isWho: info.isWho,
+  isWhen: info.isWhen,
+  isWhere: info.isWhere,
+  isDuration: info.isDuration,
+  isHowMany: info.isHowMany,
+  isWhy: info.isWhy,
+  isWhat: info.isWhat,
+  isWhich: info.isWhich,
+  isRelationship: info.isRelationship
+})}
+
+Page candidates:
+
+${candidateText}
+`;
+
+  const response =
+    await fetch(
+      "https://api.openai.com/v1/responses",
       {
-        role: "user",
+        method: "POST",
 
-        content: [
-          {
-            type: "input_text",
-            text: prompt
-          }
-        ]
-      }
-    ],
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization":
+            `Bearer ${OPENAI_API_KEY}`
+        },
 
-    max_output_tokens: 900,
+        body: JSON.stringify({
+          model: "gpt-5-mini",
 
-    text: {
-      format: {
-        type: "json_schema",
+          input: [
+            {
+              role: "system",
+              content: [
+                {
+                  type: "input_text",
+                  text: systemPrompt
+                }
+              ]
+            },
+            {
+              role: "user",
+              content: [
+                {
+                  type: "input_text",
+                  text: userPrompt
+                }
+              ]
+            }
+          ],
 
-        name: "snip_evidence",
+          text: {
+            format: {
+              type: "json_schema",
+              name: "snip_evidence",
+              strict: true,
 
-        strict: true,
-
-        schema: {
-          type: "object",
-
-          properties: {
-            evidence: {
-              type: "array",
-
-              maxItems: 2,
-
-              items: {
+              schema: {
                 type: "object",
 
                 properties: {
-                  block_index: {
-                    type: "integer"
-                  },
+                  evidence: {
+                    type: "array",
 
-                  passage: {
-                    type: "string"
+                    items: {
+                      type: "object",
+
+                      properties: {
+                        block_index: {
+                          type: "integer"
+                        },
+
+                        passage: {
+                          type: "string"
+                        }
+                      },
+
+                      required: [
+                        "block_index",
+                        "passage"
+                      ],
+
+                      additionalProperties: false
+                    }
                   }
                 },
 
                 required: [
-                  "block_index",
-                  "passage"
+                  "evidence"
                 ],
 
                 additionalProperties: false
               }
             }
-          },
-
-          required: [
-            "evidence"
-          ],
-
-          additionalProperties: false
-        }
+          }
+        })
       }
-    }
-  };
-
-  for (
-    let attempt = 0;
-    attempt < 3;
-    attempt++
-  ) {
-    const response =
-      await fetch(
-        "https://api.openai.com/v1/responses",
-        {
-          method: "POST",
-
-          headers: {
-            "Content-Type": "application/json",
-            "Authorization": `Bearer ${apiKey}`
-          },
-
-          body: JSON.stringify(body)
-        }
-      );
-
-    const text =
-      await response.text();
-
-    if (!response.ok) {
-      console.error(
-        "OpenAI HTTP error:",
-        response.status,
-        text.slice(0, 2000)
-      );
-
-      if (
-        response.status === 429 ||
-        response.status >= 500
-      ) {
-        await sleep(
-          700 * (attempt + 1)
-        );
-
-        continue;
-      }
-
-      throw new Error(
-        "OpenAI API failed"
-      );
-    }
-
-    let data;
-
-    try {
-      data =
-        JSON.parse(text);
-    } catch {
-      throw new Error(
-        "Invalid OpenAI response"
-      );
-    }
-
-    const outputText =
-      extractOutputText(data);
-
-    if (
-      outputText &&
-      outputText.trim()
-    ) {
-      return outputText;
-    }
-
-    console.error(
-      "Empty OpenAI response:",
-      JSON.stringify(data).slice(
-        0,
-        4000
-      )
     );
 
-    await sleep(
-      500 * (attempt + 1)
+  if (!response.ok) {
+    const errorText =
+      await response.text();
+
+    throw new Error(
+      `OpenAI API ${response.status}: ${errorText}`
     );
   }
 
-  throw new Error(
-    "Empty OpenAI response"
-  );
+  const data =
+    await response.json();
+
+  const outputText =
+    extractResponseText(data);
+
+  if (!outputText) {
+    throw new Error(
+      "Empty OpenAI response"
+    );
+  }
+
+  return parseJsonSafely(outputText);
 }
 
 
-// ======================================================
-// EXTRACT RESPONSE TEXT
-// ======================================================
+/* ============================================================
+   RESPONSE TEXT EXTRACTION
+   ============================================================ */
 
-function extractOutputText(data) {
+function extractResponseText(data) {
   if (
     typeof data?.output_text === "string" &&
     data.output_text.trim()
   ) {
-    return data.output_text;
+    return data.output_text.trim();
   }
+
+  const output =
+    Array.isArray(data?.output)
+      ? data.output
+      : [];
 
   const parts = [];
 
-  for (
-    const output of data?.output || []
-  ) {
-    for (
-      const content of output?.content || []
-    ) {
+  for (const item of output) {
+    if (!Array.isArray(item?.content)) {
+      continue;
+    }
+
+    for (const content of item.content) {
       if (
-        typeof content?.text === "string" &&
-        content.text.trim()
+        typeof content?.text === "string"
       ) {
         parts.push(content.text);
       }
@@ -1541,127 +1317,342 @@ function extractOutputText(data) {
 }
 
 
-// ======================================================
-// PARSE MODEL JSON
-// ======================================================
+/* ============================================================
+   SAFE JSON PARSING
+   ============================================================ */
 
-function parseModelJSON(text) {
+function parseJsonSafely(text) {
   try {
     return JSON.parse(text);
-  } catch {}
-
-  const match =
-    String(text || "")
-      .match(/\{[\s\S]*\}/);
-
-  if (!match) {
-    return null;
-  }
-
-  try {
-    return JSON.parse(
-      match[0]
-    );
   } catch {
-    return null;
-  }
-}
+    const start =
+      text.indexOf("{");
 
+    const end =
+      text.lastIndexOf("}");
 
-// ======================================================
-// SENTENCE SPLITTING
-// ======================================================
+    if (
+      start >= 0 &&
+      end > start
+    ) {
+      return JSON.parse(
+        text.slice(start, end + 1)
+      );
+    }
 
-function splitIntoSentences(text) {
-  const normalized =
-    String(text || "")
-      .replace(/\s+/g, " ")
-      .trim();
-
-  if (!normalized) {
-    return [];
-  }
-
-  const matches =
-    normalized.match(
-      /[^.!?]+(?:[.!?]+(?=\s|$)|$)/g
+    throw new Error(
+      "Could not parse OpenAI JSON response"
     );
-
-  return matches || [normalized];
+  }
 }
 
 
-// ======================================================
-// TEXT NORMALIZATION
-// ======================================================
+/* ============================================================
+   MODEL EVIDENCE VALIDATION
+   ============================================================ */
+
+function normalizeModelEvidence(
+  modelResult,
+  candidates,
+  cleanBlocks
+) {
+  const rawEvidence =
+    Array.isArray(modelResult?.evidence)
+      ? modelResult.evidence
+      : [];
+
+  const result = [];
+
+  for (const item of rawEvidence) {
+    const blockIndex =
+      Number(item?.block_index);
+
+    const passage =
+      String(item?.passage || "")
+        .replace(/\s+/g, " ")
+        .trim();
+
+    if (
+      !Number.isFinite(blockIndex) ||
+      !passage
+    ) {
+      continue;
+    }
+
+    const candidate =
+      candidates.find(
+        c =>
+          c.block_index === blockIndex &&
+          textEquivalent(c.sentence, passage)
+      );
+
+    /*
+     * The model must return text actually present in the
+     * candidate set.
+     */
+
+    if (!candidate) {
+      const candidateByBlock =
+        candidates.find(
+          c => c.block_index === blockIndex
+        );
+
+      if (!candidateByBlock) {
+        continue;
+      }
+
+      if (
+        !containsEquivalentText(
+          candidateByBlock.sentence,
+          passage
+        )
+      ) {
+        continue;
+      }
+    }
+
+    const block =
+      cleanBlocks.find(
+        b => b.index === blockIndex
+      );
+
+    result.push({
+      block_index: blockIndex,
+
+      block_id:
+        block?.id ||
+        `block-${blockIndex}`,
+
+      passage,
+
+      section:
+        block?.section ||
+        "Page"
+    });
+  }
+
+  return result;
+}
+
+
+/* ============================================================
+   TEXT MATCHING
+   ============================================================ */
 
 function normalizeText(text) {
   return String(text || "")
-    .normalize("NFKC")
-    .replace(
-      /[“”„‟]/g,
-      '"'
-    )
-    .replace(
-      /[‘’‚‛]/g,
-      "'"
-    )
-    .replace(
-      /\u00a0/g,
-      " "
-    )
-    .replace(
-      /\s+/g,
-      " "
-    )
-    .trim()
-    .toLowerCase();
+    .toLowerCase()
+    .replace(/[“”]/g, '"')
+    .replace(/[‘’]/g, "'")
+    .replace(/[–—]/g, "-")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+
+function textEquivalent(a, b) {
+  const x =
+    normalizeText(a);
+
+  const y =
+    normalizeText(b);
+
+  return (
+    x === y ||
+    x.includes(y) ||
+    y.includes(x)
+  );
 }
 
 
 function containsEquivalentText(
   source,
-  passage
+  target
 ) {
-  const a =
+  const x =
     normalizeText(source);
 
-  const b =
-    normalizeText(passage);
+  const y =
+    normalizeText(target);
 
-  if (!a || !b) {
-    return false;
-  }
-
-  if (a.includes(b)) {
-    return true;
-  }
-
-  const compactA =
-    a.replace(
-      /[^\p{L}\p{N}]+/gu,
-      ""
-    );
-
-  const compactB =
-    b.replace(
-      /[^\p{L}\p{N}]+/gu,
-      ""
-    );
-
-  return compactA.includes(
-    compactB
+  return (
+    x.includes(y) ||
+    y.includes(x)
   );
 }
 
 
-// ======================================================
-// UTILITY
-// ======================================================
+/* ============================================================
+   DEDUPE
+   ============================================================ */
 
-function sleep(ms) {
-  return new Promise(
-    resolve =>
-      setTimeout(resolve, ms)
-  );
+function dedupeEvidence(evidence) {
+  const seen = new Set();
+  const result = [];
+
+  for (const item of evidence) {
+    const key =
+      `${item.block_index}:${normalizeText(item.passage)}`;
+
+    if (seen.has(key)) {
+      continue;
+    }
+
+    seen.add(key);
+    result.push(item);
+  }
+
+  return result;
+}
+
+
+/* ============================================================
+   DETERMINISTIC OVERRIDE
+   ============================================================ */
+
+function shouldUseDeterministicOverride(
+  evidence,
+  info
+) {
+  if (!evidence.length) {
+    return true;
+  }
+
+  /*
+   * ----------------------------------------------------------
+   * WHO
+   * ----------------------------------------------------------
+   */
+
+  if (info.isWho) {
+    if (
+      !hasPersonSignal(
+        evidence[0].passage
+      )
+    ) {
+      return true;
+    }
+
+    const genericPeople =
+      /\b(?:the\s+)?(?:astronauts?|crew|people|scientists?|researchers?|soldiers?|members?|officials?)\b/i
+        .test(evidence[0].passage);
+
+    const explicitIdentity =
+      /\b(?:was|were|became|remained|stayed|served|led|commanded|piloted|flew|walked|landed|discovered|invented|married|husband|wife|brother|sister|father|mother|son|daughter|partner|spouse)\b/i
+        .test(evidence[0].passage);
+
+    if (
+      genericPeople &&
+      !explicitIdentity
+    ) {
+      return true;
+    }
+
+    /*
+     * Lunar orbit question must actually contain the relevant
+     * action and location.
+     */
+
+    if (
+      /\b(?:lunar orbit|orbit)\b/i.test(info.raw) &&
+      /\b(?:stayed|remained)\b/i.test(info.raw)
+    ) {
+      if (
+        !(
+          /\b(?:stayed|remained)\b/i.test(
+            evidence[0].passage
+          ) &&
+          /\b(?:lunar orbit|orbit)\b/i.test(
+            evidence[0].passage
+          )
+        )
+      ) {
+        return true;
+      }
+    }
+
+    /*
+     * Relationship questions must actually establish the
+     * relationship.
+     */
+
+    if (info.isRelationship) {
+      const passage =
+        evidence[0].passage;
+
+      const hasRelationship =
+        /\b(?:married|husband|wife|spouse|father|mother|son|daughter|brother|sister|partner)\b/i
+          .test(passage);
+
+      if (!hasRelationship) {
+        return true;
+      }
+
+      /*
+       * A parenthetical/citation mention like
+       * "(with her husband Pierre Curie)" is weak.
+       */
+
+      if (
+        /\bwith (?:her|his|their) (?:husband|wife|spouse)\b/i.test(passage) &&
+        !/\b(?:married|was married|were married)\b/i.test(passage)
+      ) {
+        return true;
+      }
+    }
+  }
+
+
+  /*
+   * ----------------------------------------------------------
+   * DURATION
+   * ----------------------------------------------------------
+   */
+
+  if (info.isDuration) {
+    if (
+      !/\b\d+(?:\.\d+)?\s*(?:hours?|minutes?|days?|weeks?|months?|years?)\b/i
+        .test(evidence[0].passage)
+    ) {
+      return true;
+    }
+  }
+
+
+  /*
+   * ----------------------------------------------------------
+   * WHEN
+   * ----------------------------------------------------------
+   */
+
+  if (info.isWhen) {
+    if (
+      !(
+        /\b(?:19|20)\d{2}\b/.test(evidence[0].passage) ||
+        /\b(?:january|february|march|april|may|june|july|august|september|october|november|december)\b/i.test(evidence[0].passage) ||
+        /\b\d{1,2}:\d{2}\b/.test(evidence[0].passage)
+      )
+    ) {
+      return true;
+    }
+  }
+
+
+  /*
+   * ----------------------------------------------------------
+   * WHERE
+   * ----------------------------------------------------------
+   */
+
+  if (info.isWhere) {
+    if (
+      !/\b(?:in|at|on|near|inside|outside|aboard|located|landed|arrived|departed|situated)\b/i
+        .test(evidence[0].passage)
+    ) {
+      return true;
+    }
+  }
+
+
+  return false;
 }
