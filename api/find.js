@@ -25,6 +25,7 @@ export default async function handler(req, res) {
     }
 
     const question = String(req.body?.question || "").trim();
+
     const blocks = Array.isArray(req.body?.blocks)
       ? req.body.blocks
       : [];
@@ -74,9 +75,7 @@ export default async function handler(req, res) {
 
     /*
      * --------------------------------------------------------
-     * Split the page into sentences.
-     * This gives the ranking system much more precision than
-     * treating an entire paragraph as one candidate.
+     * SENTENCE EXTRACTION
      * --------------------------------------------------------
      */
 
@@ -86,9 +85,10 @@ export default async function handler(req, res) {
       const sentences = splitIntoSentences(block.text);
 
       sentences.forEach((sentence, sentenceIndex) => {
-        const cleaned = sentence
-          .replace(/\s+/g, " ")
-          .trim();
+        const cleaned =
+          sentence
+            .replace(/\s+/g, " ")
+            .trim();
 
         if (!cleaned) return;
 
@@ -104,7 +104,7 @@ export default async function handler(req, res) {
 
     /*
      * --------------------------------------------------------
-     * Local ranking
+     * LOCAL RANKING
      * --------------------------------------------------------
      */
 
@@ -116,11 +116,9 @@ export default async function handler(req, res) {
       .sort((a, b) => b.score - a.score);
 
     /*
-     * Give the model enough context to verify the answer.
-     *
-     * We do not simply send the first N characters of the page.
-     * We send the strongest locally-ranked candidates plus their
-     * neighboring sentences.
+     * --------------------------------------------------------
+     * BUILD MODEL CANDIDATES
+     * --------------------------------------------------------
      */
 
     const candidateMap = new Map();
@@ -133,16 +131,11 @@ export default async function handler(req, res) {
 
       candidateMap.set(key, item);
 
-      /*
-       * Include nearby sentences from the same block.
-       * This helps questions where the answer is split over
-       * adjacent sentences.
-       */
-
       const neighbors = sentenceItems.filter(candidate =>
         candidate.block_index === item.block_index &&
         Math.abs(
-          candidate.sentence_index - item.sentence_index
+          candidate.sentence_index -
+          item.sentence_index
         ) <= 1
       );
 
@@ -150,31 +143,44 @@ export default async function handler(req, res) {
         const neighborKey =
           `${neighbor.block_index}:${neighbor.sentence_index}`;
 
-        candidateMap.set(neighborKey, neighbor);
+        candidateMap.set(
+          neighborKey,
+          neighbor
+        );
       }
     }
 
-    let candidates = [...candidateMap.values()]
-      .sort((a, b) => {
-        if (a.block_index !== b.block_index) {
-          return a.block_index - b.block_index;
-        }
+    let candidates =
+      [...candidateMap.values()]
+        .sort((a, b) => {
+          if (
+            a.block_index !==
+            b.block_index
+          ) {
+            return (
+              a.block_index -
+              b.block_index
+            );
+          }
 
-        return a.sentence_index - b.sentence_index;
-      });
-
-    /*
-     * Keep the request comfortably below the payload limit.
-     */
+          return (
+            a.sentence_index -
+            b.sentence_index
+          );
+        });
 
     const candidateTextParts = [];
+
     let totalChars = 0;
 
     for (const item of candidates) {
       const line =
         `[block ${item.block_index} | section: ${item.section}]\n${item.sentence}\n`;
 
-      if (totalChars + line.length > 30000) {
+      if (
+        totalChars + line.length >
+        30000
+      ) {
         break;
       }
 
@@ -196,7 +202,7 @@ export default async function handler(req, res) {
 
     /*
      * --------------------------------------------------------
-     * OpenAI verification
+     * OPENAI VERIFICATION
      * --------------------------------------------------------
      */
 
@@ -217,23 +223,25 @@ export default async function handler(req, res) {
 
     /*
      * --------------------------------------------------------
-     * Convert model result into validated evidence.
+     * VALIDATE MODEL RESULT
      * --------------------------------------------------------
      */
 
     let evidence = [];
 
     if (modelResult) {
-      evidence = normalizeModelEvidence(
-        modelResult,
-        candidates,
-        cleanBlocks
-      );
+      evidence =
+        normalizeModelEvidence(
+          modelResult,
+          candidates,
+          cleanBlocks
+        );
     }
 
     /*
-     * If the model did not produce usable evidence, use our
-     * deterministic fallback.
+     * --------------------------------------------------------
+     * DETERMINISTIC FALLBACK
+     * --------------------------------------------------------
      */
 
     if (!evidence.length) {
@@ -245,33 +253,37 @@ export default async function handler(req, res) {
 
       if (best) {
         evidence = [{
-          block_index: best.block_index,
-          block_id: best.block_id,
-          passage: best.sentence,
-          section: best.section
+          block_index:
+            best.block_index,
+
+          block_id:
+            best.block_id,
+
+          passage:
+            best.sentence,
+
+          section:
+            best.section
         }];
       }
     }
 
     /*
      * --------------------------------------------------------
-     * Final validation / precision override
+     * FINAL VALIDATION
      * --------------------------------------------------------
      */
 
     if (evidence.length) {
-      evidence = dedupeEvidence(evidence);
+      evidence =
+        dedupeEvidence(evidence);
 
-      /*
-       * For highly specific question types, if the model picked
-       * something obviously weak, replace it with the deterministic
-       * answer.
-       */
-
-      if (shouldUseDeterministicOverride(
-        evidence,
-        info
-      )) {
+      if (
+        shouldUseDeterministicOverride(
+          evidence,
+          info
+        )
+      ) {
         const best =
           findBestDeterministicSentence(
             ranked,
@@ -280,18 +292,21 @@ export default async function handler(req, res) {
 
         if (best) {
           evidence = [{
-            block_index: best.block_index,
-            block_id: best.block_id,
-            passage: best.sentence,
-            section: best.section
+            block_index:
+              best.block_index,
+
+            block_id:
+              best.block_id,
+
+            passage:
+              best.sentence,
+
+            section:
+              best.section
           }];
         }
       }
     }
-
-    /*
-     * Final answer object.
-     */
 
     return res.status(200).json({
       evidence
@@ -457,9 +472,7 @@ function scoreSentence(item, info) {
   let score = 0;
 
   /*
-   * ----------------------------------------------------------
-   * Question term overlap
-   * ----------------------------------------------------------
+   * QUESTION TERM OVERLAP
    */
 
   for (const term of info.terms) {
@@ -468,25 +481,25 @@ function scoreSentence(item, info) {
     }
   }
 
-  /*
-   * Exact phrase overlap gets more weight.
-   */
-
   const questionWords =
-    info.terms.filter(word => word.length >= 4);
+    info.terms.filter(
+      word => word.length >= 4
+    );
 
   if (
     questionWords.length >= 2 &&
-    questionWords.every(word => s.includes(word))
+    questionWords.every(
+      word => s.includes(word)
+    )
   ) {
     score += 35;
   }
 
 
   /*
-   * ----------------------------------------------------------
+   * ========================================================
    * WHO
-   * ----------------------------------------------------------
+   * ========================================================
    */
 
   if (info.isWho) {
@@ -502,7 +515,7 @@ function scoreSentence(item, info) {
         .test(sentence);
 
     /*
-     * Special high-confidence lunar-orbit question.
+     * Lunar orbit.
      */
 
     if (
@@ -511,10 +524,6 @@ function scoreSentence(item, info) {
     ) {
       score += 180;
     }
-
-    /*
-     * Strong person identity.
-     */
 
     if (
       hasPerson &&
@@ -531,11 +540,6 @@ function scoreSentence(item, info) {
       score += 30;
     }
 
-    /*
-     * Generic "astronauts", "crew", etc. should not beat a
-     * sentence that actually identifies the person.
-     */
-
     if (
       genericPeople &&
       !hasPerson
@@ -551,66 +555,130 @@ function scoreSentence(item, info) {
       score -= 80;
     }
 
+
     /*
-     * --------------------------------------------------------
-     * Relationship questions
+     * ======================================================
+     * RELATIONSHIP QUESTIONS
      *
-     * Example:
+     * IMPORTANT:
+     *
+     * "Curie became ... and her husband joined..."
+     *
+     * must NOT be considered a valid answer to:
+     *
      * "Who was Marie Curie's husband?"
      *
-     * Prefer a sentence that establishes the relationship.
-     * Penalize incidental mentions such as:
-     * "with her husband Pierre Curie..."
-     * --------------------------------------------------------
+     * because "her husband" does not identify the husband.
+     * ======================================================
      */
 
     if (info.isRelationship) {
-      const relationshipMatch =
-        /\b(?:husband|wife|father|mother|son|daughter|brother|sister|partner|spouse)\b/i
+
+      const relationshipWord =
+        /\b(?:husband|wife|spouse|father|mother|son|daughter|brother|sister|partner)\b/i
           .test(sentence);
 
-      const strongRelationship =
-        /\b(?:married|husband|wife|father|mother|son|daughter|brother|sister|partner|spouse)\b/i
+      const explicitRelationship =
+        /\b(?:married|husband|wife|spouse|father|mother|son|daughter|brother|sister|partner)\b/i
           .test(sentence);
 
-      if (strongRelationship) {
-        score += 80;
+      /*
+       * Explicit relationship gives some weight.
+       */
+
+      if (explicitRelationship) {
+        score += 60;
       }
 
+      /*
+       * Direct marriage wording is especially strong.
+       */
+
       if (
-        /\b(?:married|husband|wife|spouse)\b/i.test(sentence)
+        /\b(?:married|married to|was married to|were married)\b/i
+          .test(sentence)
+      ) {
+        score += 160;
+      }
+
+      /*
+       * "X's husband/wife" directly identifies the person.
+       */
+
+      if (
+        /\b[A-Z][A-Za-z'-]+(?:\s+[A-Z][A-Za-z'-]+){0,3}'s\s+(?:husband|wife|spouse)\b/
+          .test(sentence)
+      ) {
+        score += 140;
+      }
+
+      /*
+       * "husband X" / "wife X" can identify the person,
+       * but only if X is actually present.
+       */
+
+      if (
+        /\b(?:husband|wife|spouse)\s+[A-Z][A-Za-z'-]+(?:\s+[A-Z][A-Za-z'-]+){0,2}\b/
+          .test(sentence)
       ) {
         score += 100;
       }
 
       /*
-       * "with her husband X" is often a passing reference.
+       * "her husband" / "his wife" is NOT an answer.
        */
 
       if (
-        /\bwith (?:her|his|their) (?:husband|wife|spouse)\b/i.test(sentence)
+        /\b(?:her|his|their)\s+(?:husband|wife|spouse)\b/i
+          .test(sentence)
+      ) {
+        score -= 220;
+      }
+
+      /*
+       * "with her husband..." is an especially weak
+       * incidental reference.
+       */
+
+      if (
+        /\bwith\s+(?:her|his|their)\s+(?:husband|wife|spouse)\b/i
+          .test(sentence)
+      ) {
+        score -= 250;
+      }
+
+      /*
+       * Parenthetical relationship mentions are usually
+       * citations/context rather than the answer.
+       */
+
+      if (
+        relationshipWord &&
+        /[\(\[]/.test(sentence)
       ) {
         score -= 100;
       }
 
       /*
-       * Parenthetical citation-style mentions are weaker.
+       * If the sentence only has a pronoun relationship
+       * and no explicit relationship identity, strongly reject.
        */
 
       if (
-        relationshipMatch &&
-        /[\(\[]/.test(sentence)
+        /\b(?:her|his|their)\s+(?:husband|wife|spouse)\b/i
+          .test(sentence) &&
+        !/\b(?:married|married to)\b/i.test(sentence)
       ) {
-        score -= 80;
+        score -= 180;
       }
     }
   }
 
 
   /*
-   * ----------------------------------------------------------
+   * ========================================================
    * WHEN
-   * ----------------------------------------------------------
+   * ========================================================
    */
 
   if (info.isWhen) {
@@ -633,9 +701,9 @@ function scoreSentence(item, info) {
 
 
   /*
-   * ----------------------------------------------------------
+   * ========================================================
    * WHERE
-   * ----------------------------------------------------------
+   * ========================================================
    */
 
   if (info.isWhere) {
@@ -651,10 +719,6 @@ function scoreSentence(item, info) {
       score += 70;
     }
 
-    /*
-     * Capitalized place-name patterns.
-     */
-
     if (
       /\b(?:Moon|Earth|Mars|Atlantic|Pacific|London|Paris|New York|Washington|Dubai|Addis Ababa)\b/.test(sentence)
     ) {
@@ -664,9 +728,9 @@ function scoreSentence(item, info) {
 
 
   /*
-   * ----------------------------------------------------------
+   * ========================================================
    * DURATION
-   * ----------------------------------------------------------
+   * ========================================================
    */
 
   if (info.isDuration) {
@@ -691,9 +755,9 @@ function scoreSentence(item, info) {
 
 
   /*
-   * ----------------------------------------------------------
-   * HOW MANY / HOW MUCH
-   * ----------------------------------------------------------
+   * ========================================================
+   * HOW MANY
+   * ========================================================
    */
 
   if (info.isHowMany) {
@@ -712,9 +776,9 @@ function scoreSentence(item, info) {
 
 
   /*
-   * ----------------------------------------------------------
+   * ========================================================
    * WHY
-   * ----------------------------------------------------------
+   * ========================================================
    */
 
   if (info.isWhy) {
@@ -727,9 +791,9 @@ function scoreSentence(item, info) {
 
 
   /*
-   * ----------------------------------------------------------
+   * ========================================================
    * WHAT
-   * ----------------------------------------------------------
+   * ========================================================
    */
 
   if (info.isWhat) {
@@ -742,15 +806,15 @@ function scoreSentence(item, info) {
 
 
   /*
-   * ----------------------------------------------------------
+   * ========================================================
    * WHICH
-   * ----------------------------------------------------------
+   * ========================================================
    */
 
   if (info.isWhich) {
     if (
-      info.terms.some(term =>
-        s.includes(term)
+      info.terms.some(
+        term => s.includes(term)
       )
     ) {
       score += 35;
@@ -759,7 +823,9 @@ function scoreSentence(item, info) {
 
 
   /*
-   * Penalize navigation / metadata / citation junk.
+   * ========================================================
+   * NOISE PENALTIES
+   * ========================================================
    */
 
   if (
@@ -779,7 +845,7 @@ function scoreSentence(item, info) {
 
 
 /* ============================================================
-   PERSON SIGNAL
+   PERSON DETECTION
    ============================================================ */
 
 function hasPersonSignal(text) {
@@ -811,6 +877,94 @@ function hasPersonSignal(text) {
 
 
 /* ============================================================
+   EXPLICIT RELATIONSHIP IDENTITY
+   ============================================================ */
+
+function hasExplicitRelationshipIdentity(
+  sentence,
+  info
+) {
+  const text =
+    String(sentence || "");
+
+  /*
+   * Direct marriage:
+   *
+   * "Marie Curie married Pierre Curie."
+   */
+
+  if (
+    /\b[A-Z][A-Za-z'-]+(?:\s+[A-Z][A-Za-z'-]+){0,3}\s+(?:married|was married to|were married to)\s+[A-Z][A-Za-z'-]+(?:\s+[A-Z][A-Za-z'-]+){0,3}\b/
+      .test(text)
+  ) {
+    return true;
+  }
+
+  /*
+   * "Pierre Curie was Marie Curie's husband."
+   */
+
+  if (
+    /\b[A-Z][A-Za-z'-]+(?:\s+[A-Z][A-Za-z'-]+){0,3}\s+(?:was|were)\s+[A-Z][A-Za-z'-]+(?:\s+[A-Za-z'-]+){0,3}'s\s+(?:husband|wife|spouse)\b/
+      .test(text)
+  ) {
+    return true;
+  }
+
+  /*
+   * "Marie Curie's husband Pierre Curie..."
+   */
+
+  if (
+    /\b[A-Z][A-Za-z'-]+(?:\s+[A-Za-z'-]+){0,3}'s\s+(?:husband|wife|spouse)\s+[A-Z][A-Za-z'-]+(?:\s+[A-Za-z'-]+){0,3}\b/
+      .test(text)
+  ) {
+    return true;
+  }
+
+  /*
+   * "husband Pierre Curie"
+   */
+
+  if (
+    /\b(?:husband|wife|spouse)\s+[A-Z][A-Za-z'-]+(?:\s+[A-Z][A-Za-z'-]+){0,3}\b/
+      .test(text)
+  ) {
+    return true;
+  }
+
+  /*
+   * Explicit parent relationships.
+   */
+
+  if (
+    /\b(?:father|mother|son|daughter|brother|sister|partner)\s+[A-Z][A-Za-z'-]+(?:\s+[A-Za-z'-]+){0,3}\b/
+      .test(text)
+  ) {
+    return true;
+  }
+
+  /*
+   * Critical:
+   *
+   * "her husband"
+   * "his wife"
+   * "their spouse"
+   *
+   * is NOT explicit identification.
+   */
+
+  if (
+    /\b(?:her|his|their)\s+(?:husband|wife|spouse)\b/i.test(text)
+  ) {
+    return false;
+  }
+
+  return false;
+}
+
+
+/* ============================================================
    DETERMINISTIC FALLBACK
    ============================================================ */
 
@@ -828,10 +982,11 @@ function findBestDeterministicSentence(
       score: item.score
     }));
 
+
   /*
-   * ----------------------------------------------------------
+   * ========================================================
    * WHO
-   * ----------------------------------------------------------
+   * ========================================================
    */
 
   if (info.isWho) {
@@ -862,7 +1017,7 @@ function findBestDeterministicSentence(
       }
 
       /*
-       * Specific lunar-orbit pattern.
+       * Lunar orbit.
        */
 
       if (
@@ -880,7 +1035,7 @@ function findBestDeterministicSentence(
       }
 
       /*
-       * First-person/first-person-to-do-something pattern.
+       * First person.
        */
 
       if (
@@ -890,7 +1045,7 @@ function findBestDeterministicSentence(
       }
 
       /*
-       * Generic people without identity signal are weak.
+       * Generic people.
        */
 
       if (
@@ -908,61 +1063,100 @@ function findBestDeterministicSentence(
         item.score -= 100;
       }
 
+
       /*
-       * ------------------------------------------------------
-       * Relationship questions
-       * ------------------------------------------------------
+       * ======================================================
+       * RELATIONSHIP
+       * ======================================================
        */
 
-      if (
-        info.isRelationship
-      ) {
+      if (info.isRelationship) {
+
         /*
-         * A sentence explicitly saying "married" is very strong.
+         * The most important rule:
+         *
+         * The sentence must actually identify the person
+         * associated with the relationship.
+         */
+
+        const explicitRelationship =
+          hasExplicitRelationshipIdentity(
+            original,
+            info
+          );
+
+        if (explicitRelationship) {
+          item.score += 350;
+        } else {
+          item.score -= 150;
+        }
+
+        /*
+         * Direct marriage statement.
          */
 
         if (
-          /\b(?:married|husband|wife|spouse)\b/i.test(original)
+          /\b(?:married|was married to|were married to)\b/i
+            .test(original)
         ) {
-          item.score += 120;
-        }
-
-        if (
-          /\b(?:father|mother|son|daughter|brother|sister|partner)\b/i.test(original)
-        ) {
-          item.score += 100;
+          item.score += 220;
         }
 
         /*
-         * Strong preference for an explicit marriage statement.
+         * Explicit "X was Y's husband".
          */
 
         if (
-          /\b(?:married|married to|husband|wife|spouse)\b/i.test(original)
+          /\b(?:was|were)\b.*\b(?:husband|wife|spouse)\b/i
+            .test(original)
         ) {
-          item.score += 80;
+          item.score += 180;
         }
 
         /*
-         * Penalize incidental phrases like:
-         * "with her husband Pierre Curie..."
+         * "husband Pierre Curie" type construction.
          */
 
         if (
-          /\bwith (?:her|his|their) (?:husband|wife|spouse)\b/i.test(original)
+          /\b(?:husband|wife|spouse)\s+[A-Z][A-Za-z'-]+(?:\s+[A-Z][A-Za-z'-]+){0,3}\b/
+            .test(original)
         ) {
-          item.score -= 120;
+          item.score += 150;
         }
 
         /*
-         * Citation / parenthetical references are less reliable.
+         * ABSOLUTE PENALTY for the exact failure case:
+         *
+         * "her husband joined the faculty..."
+         */
+
+        if (
+          /\b(?:her|his|their)\s+(?:husband|wife|spouse)\b/i
+            .test(original)
+        ) {
+          item.score -= 400;
+        }
+
+        /*
+         * "with her husband..."
+         */
+
+        if (
+          /\bwith\s+(?:her|his|their)\s+(?:husband|wife|spouse)\b/i
+            .test(original)
+        ) {
+          item.score -= 450;
+        }
+
+        /*
+         * Parenthetical citation/context.
          */
 
         if (
           /[\(\[]/.test(original) &&
           /\b(?:husband|wife|spouse)\b/i.test(original)
         ) {
-          item.score -= 80;
+          item.score -= 180;
         }
       }
     }
@@ -970,9 +1164,9 @@ function findBestDeterministicSentence(
 
 
   /*
-   * ----------------------------------------------------------
+   * ========================================================
    * WHEN
-   * ----------------------------------------------------------
+   * ========================================================
    */
 
   if (info.isWhen) {
@@ -998,9 +1192,9 @@ function findBestDeterministicSentence(
 
 
   /*
-   * ----------------------------------------------------------
+   * ========================================================
    * WHERE
-   * ----------------------------------------------------------
+   * ========================================================
    */
 
   if (info.isWhere) {
@@ -1024,9 +1218,9 @@ function findBestDeterministicSentence(
 
 
   /*
-   * ----------------------------------------------------------
+   * ========================================================
    * DURATION
-   * ----------------------------------------------------------
+   * ========================================================
    */
 
   if (info.isDuration) {
@@ -1056,9 +1250,9 @@ function findBestDeterministicSentence(
 
 
   /*
-   * ----------------------------------------------------------
+   * ========================================================
    * HOW MANY
-   * ----------------------------------------------------------
+   * ========================================================
    */
 
   if (info.isHowMany) {
@@ -1072,8 +1266,8 @@ function findBestDeterministicSentence(
   }
 
 
-  scored.sort((a, b) =>
-    b.score - a.score
+  scored.sort(
+    (a, b) => b.score - a.score
   );
 
   return scored[0] || null;
@@ -1081,7 +1275,7 @@ function findBestDeterministicSentence(
 
 
 /* ============================================================
-   OPENAI CALL
+   OPENAI
    ============================================================ */
 
 async function callOpenAI({
@@ -1091,8 +1285,9 @@ async function callOpenAI({
 }) {
   const candidateText =
     candidates
-      .map((item, index) =>
-        `CANDIDATE ${index + 1}
+      .map(
+        (item, index) =>
+          `CANDIDATE ${index + 1}
 Block: ${item.block_index}
 Section: ${item.section}
 Text: ${item.sentence}`
@@ -1102,7 +1297,7 @@ Text: ${item.sentence}`
   const systemPrompt = `
 You are the answer-location engine for Snip.
 
-Snip does NOT want a general answer from you.
+Snip does NOT want a general answer.
 
 Your job is to identify the exact passage on the supplied webpage that answers the user's question.
 
@@ -1117,14 +1312,17 @@ Rules:
 5. Do not select navigation, menus, unrelated metadata, or citation fragments.
 6. The passage must actually support the question.
 7. If several passages support the answer, return the strongest relevant passages.
-8. The user will be taken directly to the selected passage, so accuracy is more important than explanation.
+8. The user will be taken directly to the selected passage.
 9. Preserve the original wording exactly.
 
 WHO:
 - Find the sentence that explicitly identifies the requested person or people.
-- If the question asks for a relationship such as husband, wife, father, mother, son, daughter, brother, sister, partner, or spouse, the selected sentence must actually establish that relationship.
-- Do NOT select a sentence that merely mentions the relationship in passing.
-- For example, for "Who was Marie Curie's husband?", a sentence like "Marie Curie married Pierre Curie in 1895" is preferred over a sentence like "Nobel Prize in Physics (1903, with her husband Pierre Curie and Henri Becquerel)."
+- Do not select a generic sentence about a group of people.
+- If the question asks for a relationship such as husband, wife, father, mother, son, daughter, brother, sister, partner, or spouse, the selected passage MUST explicitly identify the person involved in that relationship.
+- A phrase such as "her husband", "his wife", or "their spouse" is NOT enough by itself.
+- A sentence like "Curie became the first woman faculty member ... and her husband joined the faculty..." does NOT answer "Who was Marie Curie's husband?" because it never identifies the husband.
+- Prefer a sentence such as "Marie Curie married Pierre Curie in 1895" or "Pierre Curie was Marie Curie's husband."
+- Never infer the person's identity from a pronoun.
 
 WHEN:
 - Find the sentence containing the relevant date or time.
@@ -1146,7 +1344,7 @@ WHY:
 WHAT:
 - Find the sentence that directly defines or explains the requested thing.
 
-If no candidate answers the question, return an empty evidence array.
+If no candidate directly answers the question, return an empty evidence array.
 `;
 
   const userPrompt = `
@@ -1210,7 +1408,9 @@ ${candidateText}
           text: {
             format: {
               type: "json_schema",
+
               name: "snip_evidence",
+
               strict: true,
 
               schema: {
@@ -1238,7 +1438,8 @@ ${candidateText}
                         "passage"
                       ],
 
-                      additionalProperties: false
+                      additionalProperties:
+                        false
                     }
                   }
                 },
@@ -1247,7 +1448,8 @@ ${candidateText}
                   "evidence"
                 ],
 
-                additionalProperties: false
+                additionalProperties:
+                  false
               }
             }
           }
@@ -1276,12 +1478,14 @@ ${candidateText}
     );
   }
 
-  return parseJsonSafely(outputText);
+  return parseJsonSafely(
+    outputText
+  );
 }
 
 
 /* ============================================================
-   RESPONSE TEXT EXTRACTION
+   RESPONSE TEXT
    ============================================================ */
 
 function extractResponseText(data) {
@@ -1300,7 +1504,9 @@ function extractResponseText(data) {
   const parts = [];
 
   for (const item of output) {
-    if (!Array.isArray(item?.content)) {
+    if (
+      !Array.isArray(item?.content)
+    ) {
       continue;
     }
 
@@ -1318,7 +1524,7 @@ function extractResponseText(data) {
 
 
 /* ============================================================
-   SAFE JSON PARSING
+   JSON PARSER
    ============================================================ */
 
 function parseJsonSafely(text) {
@@ -1336,7 +1542,10 @@ function parseJsonSafely(text) {
       end > start
     ) {
       return JSON.parse(
-        text.slice(start, end + 1)
+        text.slice(
+          start,
+          end + 1
+        )
       );
     }
 
@@ -1383,21 +1592,23 @@ function normalizeModelEvidence(
       candidates.find(
         c =>
           c.block_index === blockIndex &&
-          textEquivalent(c.sentence, passage)
+          textEquivalent(
+            c.sentence,
+            passage
+          )
       );
-
-    /*
-     * The model must return text actually present in the
-     * candidate set.
-     */
 
     if (!candidate) {
       const candidateByBlock =
         candidates.find(
-          c => c.block_index === blockIndex
+          c =>
+            c.block_index ===
+            blockIndex
         );
 
-      if (!candidateByBlock) {
+      if (
+        !candidateByBlock
+      ) {
         continue;
       }
 
@@ -1417,7 +1628,8 @@ function normalizeModelEvidence(
       );
 
     result.push({
-      block_index: blockIndex,
+      block_index:
+        blockIndex,
 
       block_id:
         block?.id ||
@@ -1436,7 +1648,7 @@ function normalizeModelEvidence(
 
 
 /* ============================================================
-   TEXT MATCHING
+   TEXT NORMALIZATION
    ============================================================ */
 
 function normalizeText(text) {
@@ -1488,6 +1700,7 @@ function containsEquivalentText(
 
 function dedupeEvidence(evidence) {
   const seen = new Set();
+
   const result = [];
 
   for (const item of evidence) {
@@ -1507,7 +1720,7 @@ function dedupeEvidence(evidence) {
 
 
 /* ============================================================
-   DETERMINISTIC OVERRIDE
+   FINAL DETERMINISTIC OVERRIDE
    ============================================================ */
 
 function shouldUseDeterministicOverride(
@@ -1518,28 +1731,32 @@ function shouldUseDeterministicOverride(
     return true;
   }
 
+  const passage =
+    String(
+      evidence[0].passage || ""
+    );
+
+
   /*
-   * ----------------------------------------------------------
+   * ========================================================
    * WHO
-   * ----------------------------------------------------------
+   * ========================================================
    */
 
   if (info.isWho) {
     if (
-      !hasPersonSignal(
-        evidence[0].passage
-      )
+      !hasPersonSignal(passage)
     ) {
       return true;
     }
 
     const genericPeople =
       /\b(?:the\s+)?(?:astronauts?|crew|people|scientists?|researchers?|soldiers?|members?|officials?)\b/i
-        .test(evidence[0].passage);
+        .test(passage);
 
     const explicitIdentity =
       /\b(?:was|were|became|remained|stayed|served|led|commanded|piloted|flew|walked|landed|discovered|invented|married|husband|wife|brother|sister|father|mother|son|daughter|partner|spouse)\b/i
-        .test(evidence[0].passage);
+        .test(passage);
 
     if (
       genericPeople &&
@@ -1548,8 +1765,9 @@ function shouldUseDeterministicOverride(
       return true;
     }
 
+
     /*
-     * Lunar orbit question must actually contain the relevant
+     * Lunar orbit must actually contain the relevant
      * action and location.
      */
 
@@ -1559,42 +1777,57 @@ function shouldUseDeterministicOverride(
     ) {
       if (
         !(
-          /\b(?:stayed|remained)\b/i.test(
-            evidence[0].passage
-          ) &&
-          /\b(?:lunar orbit|orbit)\b/i.test(
-            evidence[0].passage
-          )
+          /\b(?:stayed|remained)\b/i.test(passage) &&
+          /\b(?:lunar orbit|orbit)\b/i.test(passage)
         )
       ) {
         return true;
       }
     }
 
+
     /*
-     * Relationship questions must actually establish the
-     * relationship.
+     * ======================================================
+     * RELATIONSHIP
+     * ======================================================
      */
 
     if (info.isRelationship) {
-      const passage =
-        evidence[0].passage;
 
-      const hasRelationship =
-        /\b(?:married|husband|wife|spouse|father|mother|son|daughter|brother|sister|partner)\b/i
-          .test(passage);
+      /*
+       * This is the key protection against:
+       *
+       * "her husband joined..."
+       */
 
-      if (!hasRelationship) {
+      if (
+        /\b(?:her|his|their)\s+(?:husband|wife|spouse)\b/i.test(passage)
+      ) {
         return true;
       }
 
       /*
-       * A parenthetical/citation mention like
-       * "(with her husband Pierre Curie)" is weak.
+       * A relationship answer must explicitly identify
+       * the person.
        */
 
       if (
-        /\bwith (?:her|his|their) (?:husband|wife|spouse)\b/i.test(passage) &&
+        !hasExplicitRelationshipIdentity(
+          passage,
+          info
+        )
+      ) {
+        return true;
+      }
+
+      /*
+       * Parenthetical relationship mentions are not enough
+       * unless the relationship is explicitly established.
+       */
+
+      if (
+        /[\(\[]/.test(passage) &&
+        /\b(?:husband|wife|spouse)\b/i.test(passage) &&
         !/\b(?:married|was married|were married)\b/i.test(passage)
       ) {
         return true;
@@ -1604,15 +1837,15 @@ function shouldUseDeterministicOverride(
 
 
   /*
-   * ----------------------------------------------------------
+   * ========================================================
    * DURATION
-   * ----------------------------------------------------------
+   * ========================================================
    */
 
   if (info.isDuration) {
     if (
       !/\b\d+(?:\.\d+)?\s*(?:hours?|minutes?|days?|weeks?|months?|years?)\b/i
-        .test(evidence[0].passage)
+        .test(passage)
     ) {
       return true;
     }
@@ -1620,17 +1853,17 @@ function shouldUseDeterministicOverride(
 
 
   /*
-   * ----------------------------------------------------------
+   * ========================================================
    * WHEN
-   * ----------------------------------------------------------
+   * ========================================================
    */
 
   if (info.isWhen) {
     if (
       !(
-        /\b(?:19|20)\d{2}\b/.test(evidence[0].passage) ||
-        /\b(?:january|february|march|april|may|june|july|august|september|october|november|december)\b/i.test(evidence[0].passage) ||
-        /\b\d{1,2}:\d{2}\b/.test(evidence[0].passage)
+        /\b(?:19|20)\d{2}\b/.test(passage) ||
+        /\b(?:january|february|march|april|may|june|july|august|september|october|november|december)\b/i.test(passage) ||
+        /\b\d{1,2}:\d{2}\b/.test(passage)
       )
     ) {
       return true;
@@ -1639,15 +1872,15 @@ function shouldUseDeterministicOverride(
 
 
   /*
-   * ----------------------------------------------------------
+   * ========================================================
    * WHERE
-   * ----------------------------------------------------------
+   * ========================================================
    */
 
   if (info.isWhere) {
     if (
       !/\b(?:in|at|on|near|inside|outside|aboard|located|landed|arrived|departed|situated)\b/i
-        .test(evidence[0].passage)
+        .test(passage)
     ) {
       return true;
     }
