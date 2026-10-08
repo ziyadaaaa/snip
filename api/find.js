@@ -76,9 +76,6 @@ export default async function handler(req, res) {
 
     // ====================================================
     // Build ALL sentences
-    //
-    // We no longer simply take the first 700 sentences.
-    // We rank the whole page first.
     // ====================================================
 
     const sentences = [];
@@ -123,10 +120,7 @@ export default async function handler(req, res) {
       .sort((a, b) => b.score - a.score);
 
     // ====================================================
-    // Select a compact but strong candidate set.
-    //
-    // Include neighbors so GPT has enough context without
-    // drowning the model in hundreds of unrelated sentences.
+    // Select candidates
     // ====================================================
 
     const selected = selectCandidates(
@@ -143,23 +137,31 @@ export default async function handler(req, res) {
           hints.push("STRONG-CANDIDATE");
         }
 
-        if (questionInfo.isDuration &&
-            hasDuration(item.sentence)) {
+        if (
+          questionInfo.isDuration &&
+          hasDuration(item.sentence)
+        ) {
           hints.push("HAS-DURATION");
         }
 
-        if (questionInfo.isLocation &&
-            hasLocationSignal(item.sentence)) {
+        if (
+          questionInfo.isLocation &&
+          hasLocationSignal(item.sentence)
+        ) {
           hints.push("HAS-LOCATION");
         }
 
-        if (questionInfo.isWho &&
-            hasPersonSignal(item.sentence)) {
+        if (
+          questionInfo.isWho &&
+          hasPersonSignal(item.sentence)
+        ) {
           hints.push("HAS-PERSON");
         }
 
-        if (questionInfo.isWhen &&
-            hasDateSignal(item.sentence)) {
+        if (
+          questionInfo.isWhen &&
+          hasDateSignal(item.sentence)
+        ) {
           hints.push("HAS-DATE");
         }
 
@@ -169,7 +171,9 @@ export default async function handler(req, res) {
           `score=${item.score}`,
           hints.length ? hints.join(" ") : "",
           item.sentence
-        ].filter(Boolean).join(" ");
+        ]
+          .filter(Boolean)
+          .join(" ");
       })
       .join("\n\n");
 
@@ -206,12 +210,14 @@ RULES:
 9. Do not choose a sentence merely because it contains a date, name, number, or location.
 10. If the webpage does not contain the answer, return an empty evidence array.
 
-QUESTION TYPE:
-
 WHO:
 - Find the sentence that explicitly identifies the requested person or people.
-- Prefer a sentence describing their role/action in the event asked about.
-- Do not select an unrelated sentence merely because it contains a person's name.
+- Match the person to the specific action, role, event, or relationship asked about.
+- For questions like "Who stayed in lunar orbit?", prefer a sentence identifying the person who stayed/remained in orbit.
+- For questions like "Who was the first person to walk on the Moon?", prefer the sentence identifying the first person.
+- A sentence mentioning "astronauts", "the crew", or another generic group is NOT enough unless it directly answers the question.
+- Do not choose an unrelated technical sentence merely because it mentions astronauts or a person's name.
+- Prefer explicit relationships such as "Collins remained...", "Armstrong became...", "Captain Smith commanded...", etc.
 
 WHEN:
 - Find the date/time that specifically answers the event in the question.
@@ -522,7 +528,6 @@ function scoreSentence(
       score += 12;
     }
 
-    // Small boost for exact phrase fragments.
     if (
       term.length >= 6 &&
       s.includes(term)
@@ -543,20 +548,68 @@ function scoreSentence(
   // ----------------------------------------------------
 
   if (info.isWho) {
-    if (hasPersonSignal(item.sentence)) {
-      score += 35;
+    const hasPerson =
+      hasPersonSignal(item.sentence);
+
+    const genericPeople =
+      /\b(?:the\s+)?(?:astronauts?|crew|people|scientists?|researchers?|soldiers?|members?|officials?)\b/i
+        .test(item.sentence);
+
+    const explicitIdentity =
+      /\b(?:was|were|became|remained|stayed|served|led|commanded|piloted|flew|walked|landed|discovered|invented|married|husband|wife|brother|sister)\b/i
+        .test(item.sentence);
+
+    // Extremely strong pattern for:
+    // "Who stayed in lunar orbit?"
+    // "Who remained in lunar orbit?"
+    if (
+      /\b(?:stayed|remained)\b/i.test(item.sentence) &&
+      /\b(?:lunar orbit|orbit)\b/i.test(item.sentence)
+    ) {
+      score += 180;
     }
 
+    // Person + meaningful action/relationship.
     if (
-      /\bwas\b|\bwere\b|\bbecome\b|\bbecame\b|\bserved\b|\bled\b|\bcommanded\b|\bpiloted\b|\bflew\b|\bstayed\b|\bremained\b/.test(s)
+      hasPerson &&
+      explicitIdentity
     ) {
-      score += 20;
+      score += 100;
     }
 
+    if (hasPerson) {
+      score += 45;
+    }
+
+    if (explicitIdentity) {
+      score += 30;
+    }
+
+    // Generic group references are weak.
     if (
-      /\baccording to\b|\bsaid\b|\breported\b/.test(s)
+      genericPeople &&
+      !hasPerson
     ) {
-      score += 5;
+      score -= 100;
+    }
+
+    // Technical sentences that only mention
+    // astronauts/crew should be strongly penalized.
+    if (
+      genericPeople &&
+      !explicitIdentity &&
+      !hasPerson
+    ) {
+      score -= 80;
+    }
+
+    // A sentence that only says someone "said" something
+    // is weaker unless the question is explicitly about who said it.
+    if (
+      /\baccording to\b|\bsaid\b|\breported\b/.test(s) &&
+      !explicitIdentity
+    ) {
+      score -= 10;
     }
   }
 
@@ -626,7 +679,6 @@ function scoreSentence(
       score += 55;
     }
 
-    // Activity duration penalties.
     if (
       /\ballotted\b|\ballocated\b|\bsample collection\b|\bdocumenting\b|\bhalfway\b|\bactivity\b|\bexperiment\b/.test(s)
     ) {
@@ -814,7 +866,6 @@ function addCandidateWithNeighbors(
     selected.push({
       ...candidate,
 
-      // Preserve original ranking.
       score:
         candidate.id === item.id
           ? item.score
@@ -859,8 +910,6 @@ function needsPrecisionOverride(
       return true;
     }
 
-    // If the question is clearly about a stay on a
-    // surface/location, require a stay signal.
     if (
       /\bmoon\b|\blunar\b|\bsurface\b/.test(info.raw)
     ) {
@@ -900,8 +949,40 @@ function needsPrecisionOverride(
   // ----------------------------------------------------
 
   if (info.isWho) {
-    if (!hasPersonSignal(passage)) {
+    if (!hasPersonSignal(evidence[0].passage)) {
       return true;
+    }
+
+    const genericPeople =
+      /\b(?:the\s+)?(?:astronauts?|crew|people|scientists?|researchers?|soldiers?|members?|officials?)\b/i
+        .test(evidence[0].passage);
+
+    const explicitIdentity =
+      /\b(?:was|were|became|remained|stayed|served|led|commanded|piloted|flew|walked|landed|discovered|invented|married|husband|wife|brother|sister)\b/i
+        .test(evidence[0].passage);
+
+    // A generic crew sentence is not enough.
+    if (
+      genericPeople &&
+      !explicitIdentity
+    ) {
+      return true;
+    }
+
+    // Specific lunar-orbit questions need an actual
+    // orbit relationship, not merely a person's name.
+    if (
+      /\b(?:lunar orbit|orbit)\b/i.test(info.raw) &&
+      /\b(?:stayed|remained)\b/i.test(info.raw)
+    ) {
+      if (
+        !(
+          /\b(?:stayed|remained)\b/i.test(evidence[0].passage) &&
+          /\b(?:lunar orbit|orbit)\b/i.test(evidence[0].passage)
+        )
+      ) {
+        return true;
+      }
     }
   }
 
@@ -953,8 +1034,14 @@ function findBestDeterministicSentence(
 
   // Additional deterministic intent-specific scoring.
   for (const item of sentences) {
+    // IMPORTANT:
+    // Keep the original passage for person detection.
+    // Do not pass the lowercased version to hasPersonSignal().
+    const original =
+      item.passage;
+
     const s =
-      item.passage.toLowerCase();
+      original.toLowerCase();
 
     // --------------------------------------------------
     // Duration
@@ -1011,20 +1098,70 @@ function findBestDeterministicSentence(
     }
 
     // --------------------------------------------------
-    // Who
+    // WHO
     // --------------------------------------------------
 
     if (info.isWho) {
-      if (
-        hasPersonSignal(s)
-      ) {
-        item.score += 80;
+      const hasPerson =
+        hasPersonSignal(original);
+
+      const genericPeople =
+        /\b(?:the\s+)?(?:astronauts?|crew|people|scientists?|researchers?|soldiers?|members?|officials?)\b/i
+          .test(original);
+
+      const explicitIdentity =
+        /\b(?:was|were|became|remained|stayed|served|led|commanded|piloted|flew|walked|landed|discovered|invented|married|husband|wife|brother|sister)\b/i
+          .test(original);
+
+      // Strong person evidence.
+      if (hasPerson) {
+        item.score += 100;
       }
 
+      // Strong action / relationship evidence.
+      if (explicitIdentity) {
+        item.score += 70;
+      }
+
+      // Exact orbital question pattern.
       if (
-        /\bremained\b|\bstayed\b|\bserved\b|\bled\b|\bcommanded\b|\bpiloted\b|\bflew\b|\bbecame\b|\bwas the first\b/.test(s)
+        /\b(?:stayed|remained)\b/i.test(original) &&
+        /\b(?:lunar orbit|orbit)\b/i.test(original)
       ) {
-        item.score += 60;
+        item.score += 180;
+      }
+
+      // Strong pattern:
+      // "Collins remained in lunar orbit..."
+      if (
+        /\b[A-Z][a-z'-]{2,}\s+(?:stayed|remained)\b/i.test(original) &&
+        /\b(?:lunar orbit|orbit)\b/i.test(original)
+      ) {
+        item.score += 100;
+      }
+
+      // First-person achievement patterns.
+      if (
+        /\bwas the first\b|\bbecame the first\b/.test(s)
+      ) {
+        item.score += 100;
+      }
+
+      // Generic references without identification are weak.
+      if (
+        genericPeople &&
+        !hasPerson
+      ) {
+        item.score -= 140;
+      }
+
+      // Generic crew sentences with no identity/action.
+      if (
+        genericPeople &&
+        !explicitIdentity &&
+        !hasPerson
+      ) {
+        item.score -= 100;
       }
     }
 
@@ -1134,17 +1271,57 @@ function hasLocationSignal(text) {
 }
 
 
+// ======================================================
+// PERSON DETECTION
+// ======================================================
+
 function hasPersonSignal(text) {
   const s =
     String(text || "");
 
-  return (
-    /\b(?:he|she|they|him|her|them)\b/i.test(s) ||
+  // ----------------------------------------------------
+  // Explicit titles + names
+  // ----------------------------------------------------
 
-    /\b(?:Mr\.|Mrs\.|Ms\.|Dr\.|Captain|Commander|President|Professor)\s+[A-Z][A-Za-z'-]+/i.test(s) ||
+  if (
+    /\b(?:Mr\.|Mrs\.|Ms\.|Dr\.|Prof\.|Professor|Captain|Commander|Colonel|General|President)\s+[A-Z][A-Za-z'-]+(?:\s+[A-Z][A-Za-z'-]+){0,3}\b/
+      .test(s)
+  ) {
+    return true;
+  }
 
+  // ----------------------------------------------------
+  // Two-word proper names
+  //
+  // Examples:
+  // Neil Armstrong
+  // Marie Curie
+  // Edward Smith
+  // ----------------------------------------------------
+
+  if (
     /\b[A-Z][a-z'-]+\s+[A-Z][a-z'-]+\b/.test(s)
-  );
+  ) {
+    return true;
+  }
+
+  // ----------------------------------------------------
+  // Single surname/name directly performing an action
+  //
+  // Examples:
+  // Collins remained...
+  // Armstrong walked...
+  // Curie discovered...
+  // ----------------------------------------------------
+
+  if (
+    /\b[A-Z][a-z'-]{2,}\s+(?:was|were|became|remained|stayed|served|led|commanded|piloted|flew|walked|landed|discovered|invented|married)\b/
+      .test(s)
+  ) {
+    return true;
+  }
+
+  return false;
 }
 
 
