@@ -626,20 +626,45 @@ function scoreSentence(item, info) {
    * WHEN
    * ========================================================
    *
-   * A date alone is not enough.
+   * Date alone is NOT enough.
    *
-   * We strongly prefer a sentence where the date is tied
-   * to the event being asked about.
+   * We strongly prefer a date that is directly connected
+   * to the event asked about.
+   *
+   * Special protection for award/Nobel questions:
+   *
+   *   date + award/prize + actual award action
+   *   + relevant question terms
+   *
+   * This prevents citation fragments such as:
+   *
+   * "extraordinary services they have rendered..."
+   *
+   * from beating the actual 1903 award sentence.
    * ========================================================
    */
 
   if (info.isWhen) {
-    const hasDate =
-      /\b(?:19|20)\d{2}\b/.test(sentence) ||
-      /\b(?:january|february|march|april|may|june|july|august|september|october|november|december)\b/i.test(sentence) ||
-      /\b(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b/i.test(sentence) ||
+    const hasYear =
+      /\b(?:18|19|20)\d{2}\b/.test(sentence);
+
+    const hasMonth =
+      /\b(?:january|february|march|april|may|june|july|august|september|october|november|december)\b/i
+        .test(sentence);
+
+    const hasDay =
+      /\b(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b/i
+        .test(sentence);
+
+    const hasTime =
       /\b\d{1,2}:\d{2}\b/.test(sentence) ||
       /\b(?:utc|gmt|est|edt|pst|pdt)\b/i.test(sentence);
+
+    const hasDate =
+      hasYear ||
+      hasMonth ||
+      hasDay ||
+      hasTime;
 
     if (hasDate) {
       score += 80;
@@ -649,48 +674,142 @@ function scoreSentence(item, info) {
      * Event/date connection.
      */
 
-    if (
+    const eventConnection =
       /\b(?:occurred|happened|took place|began|started|ended|launched|landed|arrived|departed|born|died|married|won|received|awarded|was awarded|was born|was launched)\b/i
-        .test(sentence)
-    ) {
+        .test(sentence);
+
+    if (eventConnection) {
       score += 90;
     }
 
     /*
-     * Award/Nobel questions.
+     * Award/Nobel detection.
      */
 
-    if (
-      /\b(?:nobel|prize|award|awarded|won|received|honou?red|honou?red with)\b/i
-        .test(sentence)
-    ) {
+    const isAwardQuestion =
+      /\b(?:nobel|prize|award|awarded|won|received)\b/i
+        .test(info.raw);
+
+    const hasAwardWord =
+      /\b(?:nobel|prize|award|awarded|won|received)\b/i
+        .test(sentence);
+
+    const hasAwardAction =
+      /\b(?:won|received|awarded|was awarded|awarded the|won the|received the)\b/i
+        .test(sentence);
+
+    if (hasAwardWord) {
       score += 70;
     }
 
     /*
-     * Date phrasing.
+     * VERY strong award match:
+     *
+     * date + award wording + award action.
+     */
+
+    if (
+      isAwardQuestion &&
+      hasDate &&
+      hasAwardWord &&
+      hasAwardAction
+    ) {
+      score += 220;
+    }
+
+    /*
+     * Match important question terms.
+     *
+     * For:
+     * "When did Marie Curie win her first Nobel Prize?"
+     *
+     * terms include:
+     * marie, curie, win, first, nobel, prize
+     *
+     * A sentence containing Curie + Nobel + awarded
+     * should strongly beat a citation fragment.
+     */
+
+    const importantWhenTerms =
+      info.terms.filter(
+        term =>
+          term.length >= 4 &&
+          ![
+            "when",
+            "what",
+            "date",
+            "time"
+          ].includes(term)
+      );
+
+    const matchingWhenTerms =
+      importantWhenTerms.filter(
+        term => s.includes(term)
+      ).length;
+
+    if (matchingWhenTerms >= 1) {
+      score += 35;
+    }
+
+    if (matchingWhenTerms >= 2) {
+      score += 70;
+    }
+
+    if (matchingWhenTerms >= 3) {
+      score += 110;
+    }
+
+    /*
+     * The strongest possible pattern:
+     *
+     * date + award + person/event terms.
+     */
+
+    if (
+      isAwardQuestion &&
+      hasDate &&
+      hasAwardAction &&
+      matchingWhenTerms >= 2
+    ) {
+      score += 180;
+    }
+
+    /*
+     * Direct date phrasing.
      */
 
     if (
       hasDate &&
-      /\b(?:when|in|on|during|after|before)\b/i.test(sentence)
+      /\b(?:in|on|during|after|before)\b/i.test(sentence)
     ) {
       score += 20;
     }
 
     /*
-     * A sentence containing a date but merely discussing
-     * background/history is weaker.
+     * Penalize background/citation sentences.
      */
 
     if (
       hasDate &&
       /\b(?:researches|services|phenomena|career|history|later|earlier)\b/i
         .test(sentence) &&
-      !/\b(?:occurred|happened|took place|began|started|ended|launched|landed|arrived|departed|born|died|married|won|received|awarded)\b/i
-        .test(sentence)
+      !eventConnection
     ) {
-      score -= 40;
+      score -= 70;
+    }
+
+    /*
+     * A Nobel citation fragment that lacks an actual
+     * award action should be heavily penalized for an
+     * award WHEN question.
+     */
+
+    if (
+      isAwardQuestion &&
+      hasAwardWord &&
+      !hasAwardAction
+    ) {
+      score -= 140;
     }
   }
 
@@ -774,18 +893,6 @@ function scoreSentence(item, info) {
    * ========================================================
    * WHY
    * ========================================================
-   *
-   * Stronger cause detection.
-   *
-   * The goal is to prefer:
-   *
-   * "The Depression was caused by..."
-   *
-   * over:
-   *
-   * "This caused economic stagnation..."
-   *
-   * ========================================================
    */
 
   if (info.isWhy) {
@@ -819,10 +926,6 @@ function scoreSentence(item, info) {
       score += 120;
     }
 
-    /*
-     * Explicit cause wording is especially strong.
-     */
-
     if (
       /\b(?:one of the main causes|major cause|primary cause|main cause|key factor|major factor|primary factor|important factor|factors included|factors were|was caused by|were caused by)\b/i
         .test(sentence)
@@ -830,21 +933,12 @@ function scoreSentence(item, info) {
       score += 100;
     }
 
-    /*
-     * Strongly prefer sentences that explicitly connect
-     * the cause to the subject.
-     */
-
     if (
       /\b(?:the\s+)?(?:great depression|depression)\b/i.test(sentence) &&
       /\b(?:caused by|cause of|causes included|caused|resulted from|stemmed from|triggered by|factors included)\b/i.test(sentence)
     ) {
       score += 150;
     }
-
-    /*
-     * Downstream consequences should not beat actual causes.
-     */
 
     if (
       /\b(?:recovery|stagnation|decline|aftermath|consequence|resulting economy|economic recovery)\b/i
@@ -854,14 +948,6 @@ function scoreSentence(item, info) {
     ) {
       score -= 50;
     }
-
-    /*
-     * "X led to Y" is dangerous for WHY questions:
-     *
-     * "This policy led to economic stagnation"
-     *
-     * does not necessarily explain what caused X.
-     */
 
     if (
       /\b(?:led to|resulted in|caused)\b/i.test(sentence) &&
@@ -991,7 +1077,7 @@ function hasExplicitRelationshipIdentity(
   }
 
   if (
-    /\b(?:husband|wife|spouse)\s+[A-Z][A-Za-z'-]+(?:\s+[A-Z][A-Za-z'-]+){0,3}\b/
+    /\b(?:husband|wife|spouse)\s+[A-Z][A-Za-z'-]+(?:\s+[A-Za-z'-]+){0,3}\b/
       .test(text)
   ) {
     return true;
@@ -1133,7 +1219,7 @@ function findBestDeterministicSentence(
         }
 
         if (
-          /\b(?:husband|wife|spouse)\s+[A-Z][A-Za-z'-]+(?:\s+[A-Z][A-Za-z'-]+){0,3}\b/
+          /\b(?:husband|wife|spouse)\s+[A-Z][A-Za-z'-]+(?:\s+[A-Za-z'-]+){0,3}\b/
             .test(original)
         ) {
           item.score += 150;
@@ -1172,49 +1258,142 @@ function findBestDeterministicSentence(
 
   if (info.isWhen) {
     for (const item of scored) {
+      const original =
+        String(item.sentence || "");
+
       const s =
-        item.sentence.toLowerCase();
+        original.toLowerCase();
+
+      const hasYear =
+        /\b(?:18|19|20)\d{2}\b/.test(original);
+
+      const hasMonth =
+        /\b(?:january|february|march|april|may|june|july|august|september|october|november|december)\b/i
+          .test(original);
+
+      const hasDay =
+        /\b(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b/i
+          .test(original);
+
+      const hasTime =
+        /\b\d{1,2}:\d{2}\b/.test(original) ||
+        /\b(?:utc|gmt|est|edt|pst|pdt)\b/i.test(original);
 
       const hasDate =
-        /\b(?:19|20)\d{2}\b/.test(item.sentence) ||
-        /\b(?:january|february|march|april|may|june|july|august|september|october|november|december)\b/i.test(item.sentence) ||
-        /\b(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b/i.test(item.sentence) ||
-        /\b\d{1,2}:\d{2}\b/.test(item.sentence);
+        hasYear ||
+        hasMonth ||
+        hasDay ||
+        hasTime;
 
       if (hasDate) {
         item.score += 80;
       }
 
-      if (
-        /\b(?:launch|launched|landed|began|started|ended|occurred|happened|took place|born|died|married|won|received|awarded|was awarded)\b/i.test(s)
-      ) {
+      const eventConnection =
+        /\b(?:launch|launched|landed|began|started|ended|occurred|happened|took place|born|died|married|won|received|awarded|was awarded|arrived|departed)\b/i
+          .test(s);
+
+      if (eventConnection) {
         item.score += 90;
       }
 
-      if (
-        /\b(?:nobel|prize|award|awarded|won|received)\b/i.test(s)
-      ) {
+      const isAwardQuestion =
+        /\b(?:nobel|prize|award|awarded|won|received)\b/i
+          .test(info.raw);
+
+      const hasAwardWord =
+        /\b(?:nobel|prize|award|awarded|won|received)\b/i
+          .test(s);
+
+      const hasAwardAction =
+        /\b(?:won|received|awarded|was awarded|awarded the|won the|received the)\b/i
+          .test(s);
+
+      if (hasAwardWord) {
         item.score += 70;
       }
 
       /*
-       * If the question is specifically about an award,
-       * require award-related wording to be strongly favored.
+       * Strong award match:
+       *
+       * DATE + AWARD + ACTION
        */
 
       if (
-        /\b(?:nobel|prize|award)\b/i.test(info.raw) &&
-        /\b(?:nobel|prize|award|awarded|won|received)\b/i.test(s)
+        isAwardQuestion &&
+        hasDate &&
+        hasAwardWord &&
+        hasAwardAction
       ) {
-        item.score += 100;
+        item.score += 220;
+      }
+
+      /*
+       * Important question-term overlap.
+       */
+
+      const importantWhenTerms =
+        info.terms.filter(
+          term =>
+            term.length >= 4 &&
+            ![
+              "when",
+              "what",
+              "date",
+              "time"
+            ].includes(term)
+        );
+
+      const matchingWhenTerms =
+        importantWhenTerms.filter(
+          term => s.includes(term)
+        ).length;
+
+      if (matchingWhenTerms >= 1) {
+        item.score += 35;
+      }
+
+      if (matchingWhenTerms >= 2) {
+        item.score += 70;
+      }
+
+      if (matchingWhenTerms >= 3) {
+        item.score += 110;
       }
 
       if (
+        isAwardQuestion &&
         hasDate &&
-        /\b(?:researches|services|phenomena|career|history|later|earlier)\b/i.test(s) &&
-        !/\b(?:occurred|happened|took place|began|started|ended|launched|landed|arrived|departed|born|died|married|won|received|awarded)\b/i.test(s)
+        hasAwardAction &&
+        matchingWhenTerms >= 2
       ) {
-        item.score -= 40;
+        item.score += 180;
+      }
+
+      /*
+       * Penalize citation/background language.
+       */
+
+      if (
+        hasDate &&
+        /\b(?:researches|services|phenomena|career|history|later|earlier)\b/i
+          .test(s) &&
+        !eventConnection
+      ) {
+        item.score -= 70;
+      }
+
+      /*
+       * A Nobel/prize sentence without an actual
+       * award action is weak for a WHEN question.
+       */
+
+      if (
+        isAwardQuestion &&
+        hasAwardWord &&
+        !hasAwardAction
+      ) {
+        item.score -= 140;
       }
     }
   }
@@ -1342,21 +1521,13 @@ function findBestDeterministicSentence(
         item.score += 120;
       }
 
-      /*
-       * Great Depression-specific strengthening.
-       */
-
       if (
         /\b(?:great depression|depression)\b/i.test(s) &&
-        /\b(?:caused by|causes included|caused|resulted from|stemmed from|triggered by|factors included)\b/i.test(s)
+        /\b(?:caused by|causes included|caused|resulted from|stemmed from|triggered by|factors included)\b/i
+          .test(s)
       ) {
         item.score += 180;
       }
-
-      /*
-       * Penalize consequences when they don't explain
-       * the cause.
-       */
 
       if (
         /\b(?:recovery|stagnation|decline|aftermath|consequence|resulting economy|economic recovery)\b/i
@@ -1440,8 +1611,9 @@ WHEN:
 - The date must be connected to the event in the question.
 - Do NOT select a sentence merely because it contains a year, month, or date.
 - Do NOT select a citation fragment or background sentence that happens to contain a date.
-- For award questions, the selected passage must actually connect the date to the award or prize.
-- Prefer explicit wording such as "In 1903, Marie Curie was awarded..." or "Marie Curie won the Nobel Prize in 1903."
+- For award questions, the selected passage MUST contain a date and must explicitly connect that date to the award or prize.
+- Prefer wording such as "In 1903, Marie Curie was awarded..." or "Marie Curie won the Nobel Prize in 1903."
+- A sentence about "services", "researches", "radiation phenomena", or Nobel committee wording is not sufficient unless it explicitly establishes when the award was won.
 - For launch questions, prefer wording such as "Apollo 11 launched on July 16, 1969."
 - For landing questions, prefer wording that connects the date directly to the landing.
 - If a candidate contains a date but does not establish when the requested event happened, do not select it.
@@ -1955,24 +2127,47 @@ function shouldUseDeterministicOverride(
    * WHEN
    * ========================================================
    *
-   * The old check only asked:
+   * Strong validation for date/event questions.
    *
-   * "Does this sentence contain a date?"
+   * For award questions:
    *
-   * That allowed the Marie Curie failure:
+   *   DATE
+   *   +
+   *   AWARD WORD
+   *   +
+   *   AWARD ACTION
    *
-   * date + unrelated Nobel/citation sentence.
+   * must be present.
    *
-   * Now the sentence must contain a date AND language
-   * connecting that date to the requested event.
+   * Additionally, the passage should contain relevant
+   * question terms.
    * ========================================================
    */
 
   if (info.isWhen) {
+    const lower =
+      passage.toLowerCase();
+
+    const hasYear =
+      /\b(?:18|19|20)\d{2}\b/.test(passage);
+
+    const hasMonth =
+      /\b(?:january|february|march|april|may|june|july|august|september|october|november|december)\b/i
+        .test(passage);
+
+    const hasDay =
+      /\b(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b/i
+        .test(passage);
+
+    const hasTime =
+      /\b\d{1,2}:\d{2}\b/.test(passage) ||
+      /\b(?:utc|gmt|est|edt|pst|pdt)\b/i.test(passage);
+
     const hasDate =
-      /\b(?:19|20)\d{2}\b/.test(passage) ||
-      /\b(?:january|february|march|april|may|june|july|august|september|october|november|december)\b/i.test(passage) ||
-      /\b\d{1,2}:\d{2}\b/.test(passage);
+      hasYear ||
+      hasMonth ||
+      hasDay ||
+      hasTime;
 
     if (!hasDate) {
       return true;
@@ -1982,25 +2177,69 @@ function shouldUseDeterministicOverride(
      * Award-specific validation.
      */
 
-    if (
-      /\b(?:nobel|prize|award)\b/i.test(info.raw)
-    ) {
-      if (
-        !/\b(?:nobel|prize|award|awarded|won|received)\b/i.test(passage)
-      ) {
+    const isAwardQuestion =
+      /\b(?:nobel|prize|award|awarded|won|received)\b/i
+        .test(info.raw);
+
+    if (isAwardQuestion) {
+      const hasAwardWord =
+        /\b(?:nobel|prize|award|awarded|won|received)\b/i
+          .test(lower);
+
+      const hasAwardAction =
+        /\b(?:won|received|awarded|was awarded|awarded the|won the|received the)\b/i
+          .test(lower);
+
+      if (!hasAwardWord) {
         return true;
       }
 
       /*
-       * A date + "Nobel" is still not enough if the
-       * sentence doesn't connect the two.
+       * Crucial fix:
+       *
+       * "Nobel" + date is NOT enough.
+       *
+       * The sentence must actually say that the person
+       * won/received/was awarded the prize.
        */
 
-      const awardConnection =
-        /\b(?:won|received|awarded|was awarded|awarded the|won the|received the)\b/i
-          .test(passage);
+      if (!hasAwardAction) {
+        return true;
+      }
 
-      if (!awardConnection) {
+      /*
+       * Match the important terms from the question.
+       */
+
+      const importantTerms =
+        info.terms.filter(
+          term =>
+            term.length >= 4 &&
+            ![
+              "when",
+              "what",
+              "date",
+              "time"
+            ].includes(term)
+        );
+
+      const matchedTerms =
+        importantTerms.filter(
+          term => lower.includes(term)
+        ).length;
+
+      /*
+       * For an award WHEN question, require at least
+       * two meaningful question terms when possible.
+       *
+       * This prevents generic Nobel citation sentences
+       * from passing.
+       */
+
+      if (
+        importantTerms.length >= 2 &&
+        matchedTerms < 2
+      ) {
         return true;
       }
     }
@@ -2013,12 +2252,6 @@ function shouldUseDeterministicOverride(
       /\b(?:occurred|happened|took place|began|started|ended|launched|landed|arrived|departed|born|died|married|won|received|awarded|was awarded|was born|was launched)\b/i
         .test(passage);
 
-    /*
-     * If the question is a specific event question,
-     * require event wording rather than accepting an
-     * arbitrary historical sentence with a year.
-     */
-
     if (!eventConnection) {
       const questionTerms =
         info.terms.filter(
@@ -2028,15 +2261,8 @@ function shouldUseDeterministicOverride(
       const matchedTerms =
         questionTerms.filter(
           term =>
-            passage
-              .toLowerCase()
-              .includes(term)
+            lower.includes(term)
         ).length;
-
-      /*
-       * Permit a highly direct date sentence when it
-       * contains multiple important question terms.
-       */
 
       if (
         matchedTerms < 2
@@ -2044,16 +2270,25 @@ function shouldUseDeterministicOverride(
         return true;
       }
     }
+
+    /*
+     * Citation/background language should not survive
+     * when it doesn't explicitly establish the event.
+     */
+
+    if (
+      /\b(?:researches|services|phenomena|career|history|later|earlier)\b/i
+        .test(lower) &&
+      !eventConnection
+    ) {
+      return true;
+    }
   }
 
 
   /*
    * ========================================================
    * WHY
-   * ========================================================
-   *
-   * Do not allow OpenAI to return a downstream consequence
-   * when the question asks for the cause.
    * ========================================================
    */
 
@@ -2075,21 +2310,12 @@ function shouldUseDeterministicOverride(
       /\b(?:because|due to|since|as a result of|reason|caused by|caused|cause|causes|resulted from|resulting from|triggered|contributed to|contributing to|led to|stemmed from|arose from|driven by|in response to)\b/i
         .test(passage);
 
-    /*
-     * If there is no cause language and very little
-     * connection to the question, reject it.
-     */
-
     if (
       !hasCauseLanguage &&
       matchingTerms < 2
     ) {
       return true;
     }
-
-    /*
-     * Strongly reject pure consequence sentences.
-     */
 
     if (
       /\b(?:recovery|stagnation|decline|aftermath|consequence|resulting economy|economic recovery)\b/i
@@ -2100,20 +2326,10 @@ function shouldUseDeterministicOverride(
       return true;
     }
 
-    /*
-     * "X led to Y" is not automatically an answer to
-     * "What caused X?"
-     */
-
     if (
       /\b(?:led to|resulted in|caused)\b/i.test(passage) &&
       !/\b(?:caused by|resulted from|stemmed from|because|due to|factor|cause of)\b/i.test(passage)
     ) {
-      /*
-       * Keep it only if it has strong question-term overlap.
-       * Otherwise use the deterministic cause search.
-       */
-
       if (matchingTerms < 3) {
         return true;
       }
